@@ -1,0 +1,4 @@
+task_0:
+ video_path: "test_video.mp4"
+ audio_path: "translated_voice.wav"
+ result_name: "test_video_translated_voice.mp4"

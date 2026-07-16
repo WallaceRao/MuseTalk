@@ -19,6 +19,7 @@ from musetalk.utils.face_parsing import FaceParsing
 from musetalk.utils.audio_processor import AudioProcessor
 from musetalk.utils.utils import get_file_type, get_video_fps, datagen, load_all_model
 from musetalk.utils.preprocessing import get_landmark_and_bbox, read_imgs, coord_placeholder
+from musetalk.utils.active_speaker import LRASDDetector
 
 def fast_check_ffmpeg():
     try:
@@ -161,10 +162,14 @@ def main(args):
             
             print(f"Number of frames: {len(frame_list)}")         
             
-            # Process each frame
-            input_latent_list = []
-            for bbox, frame in zip(coord_list, frame_list):
+            # Build per-frame latents aligned with frame_list indices.
+            # Skipping placeholder frames would shift latents and paste the wrong face.
+            input_latent_list = [None] * len(frame_list)
+            last_valid_latent = None
+            for i, (bbox, frame) in enumerate(zip(coord_list, frame_list)):
                 if bbox == coord_placeholder:
+                    if last_valid_latent is not None:
+                        input_latent_list[i] = last_valid_latent
                     continue
                 x1, y1, x2, y2 = bbox
                 if args.version == "v15":
@@ -173,8 +178,36 @@ def main(args):
                 crop_frame = frame[y1:y2, x1:x2]
                 crop_frame = cv2.resize(crop_frame, (256,256), interpolation=cv2.INTER_LANCZOS4)
                 latents = vae.get_latents_for_unet(crop_frame)
-                input_latent_list.append(latents)
-        
+                input_latent_list[i] = latents
+                last_valid_latent = latents
+
+            first_valid_latent = next((latent for latent in input_latent_list if latent is not None), None)
+            if first_valid_latent is None:
+                raise ValueError("No valid face detected in the input video")
+            for i, latent in enumerate(input_latent_list):
+                if latent is None:
+                    input_latent_list[i] = first_valid_latent
+
+            speaking_mask = None
+            if args.use_lr_asd:
+                print("Running LR-ASD active speaker detection")
+                asd_detector = LRASDDetector(
+                    model_path=args.asd_model_path,
+                    device=device,
+                    threshold=args.asd_threshold,
+                )
+                speaking_mask, asd_scores = asd_detector.compute_speaking_mask(
+                    audio_path=audio_path,
+                    frame_list=frame_list,
+                    coord_list=coord_list,
+                    fps=fps,
+                )
+                speaking_frames = sum(speaking_mask)
+                print(
+                    f"LR-ASD: {speaking_frames}/{len(speaking_mask)} frames marked as speaking "
+                    f"(threshold={args.asd_threshold})"
+                )
+
             # Smooth first and last frames
             frame_list_cycle = frame_list + frame_list[::-1]
             coord_list_cycle = coord_list + coord_list[::-1]
@@ -182,7 +215,8 @@ def main(args):
             
             # Batch inference
             print("Starting inference")
-            video_num = len(whisper_chunks)
+            video_num = min(len(whisper_chunks), len(frame_list))
+            whisper_chunks = whisper_chunks[:video_num]
             batch_size = args.batch_size
             gen = datagen(
                 whisper_chunks=whisper_chunks,
@@ -208,32 +242,54 @@ def main(args):
             # Pad generated images to original video size
             print("Padding generated images to original video size")
             for i, res_frame in enumerate(tqdm(res_frame_list)):
-                bbox = coord_list_cycle[i%(len(coord_list_cycle))]
-                ori_frame = copy.deepcopy(frame_list_cycle[i%(len(frame_list_cycle))])
+                frame_idx = i % len(frame_list_cycle)
+                bbox = coord_list_cycle[frame_idx]
+                ori_frame = copy.deepcopy(frame_list_cycle[frame_idx])
                 x1, y1, x2, y2 = bbox
                 if args.version == "v15":
                     y2 = y2 + args.extra_margin
-                    y2 = min(y2, frame.shape[0])
-                try:
-                    res_frame = cv2.resize(res_frame.astype(np.uint8), (x2-x1, y2-y1))
-                except:
-                    continue
-                
-                # Merge results with version-specific parameters
-                if args.version == "v15":
-                    combine_frame = get_image(ori_frame, res_frame, [x1, y1, x2, y2], mode=args.parsing_mode, fp=fp)
+                    y2 = min(y2, ori_frame.shape[0])
+
+                should_lipsync = True
+                if args.use_lr_asd and speaking_mask is not None:
+                    mask_idx = frame_idx % len(speaking_mask)
+                    should_lipsync = speaking_mask[mask_idx]
+
+                if (
+                    not should_lipsync
+                    or bbox == coord_placeholder
+                    or x2 <= x1
+                    or y2 <= y1
+                ):
+                    combine_frame = ori_frame
                 else:
-                    combine_frame = get_image(ori_frame, res_frame, [x1, y1, x2, y2], fp=fp)
+                    try:
+                        res_frame = cv2.resize(res_frame.astype(np.uint8), (x2-x1, y2-y1))
+                        if args.version == "v15":
+                            combine_frame = get_image(ori_frame, res_frame, [x1, y1, x2, y2], mode=args.parsing_mode, fp=fp)
+                        else:
+                            combine_frame = get_image(ori_frame, res_frame, [x1, y1, x2, y2], fp=fp)
+                    except Exception:
+                        combine_frame = ori_frame
+
                 cv2.imwrite(f"{result_img_save_path}/{str(i).zfill(8)}.png", combine_frame)
 
             # Save prediction results
             temp_vid_path = f"{temp_dir}/temp_{input_basename}_{audio_basename}.mp4"
             cmd_img2video = f"ffmpeg -y -v warning -r {fps} -f image2 -i {result_img_save_path}/%08d.png -vcodec libx264 -vf format=yuv420p -crf 18 {temp_vid_path}"
             print("Video generation command:", cmd_img2video)
-            os.system(cmd_img2video)   
-            
-            cmd_combine_audio = f"ffmpeg -y -v warning -i {audio_path} -i {temp_vid_path} {output_vid_name}"
-            print("Audio combination command:", cmd_combine_audio) 
+            os.system(cmd_img2video)
+
+            if get_file_type(video_path) == "video":
+                cmd_combine_audio = (
+                    f"ffmpeg -y -v warning -i {temp_vid_path} -i {video_path} "
+                    f"-map 0:v:0 -map 1:a:0? -c:v copy -c:a copy -shortest {output_vid_name}"
+                )
+            else:
+                cmd_combine_audio = (
+                    f"ffmpeg -y -v warning -i {temp_vid_path} -c:v copy {output_vid_name}"
+                )
+            print("Audio combination command:", cmd_combine_audio)
             os.system(cmd_combine_audio)
             
             # Clean up temporary files
@@ -272,5 +328,9 @@ if __name__ == "__main__":
     parser.add_argument("--left_cheek_width", type=int, default=90, help="Width of left cheek region")
     parser.add_argument("--right_cheek_width", type=int, default=90, help="Width of right cheek region")
     parser.add_argument("--version", type=str, default="v15", choices=["v1", "v15"], help="Model version to use")
+    parser.add_argument("--disable_lr_asd", action="store_true", help="Disable LR-ASD gating and lip-sync all detected faces")
+    parser.add_argument("--asd_model_path", type=str, default="./third_party/LR-ASD/weight/finetuning_TalkSet.model", help="Path to LR-ASD model weights")
+    parser.add_argument("--asd_threshold", type=float, default=0.0, help="LR-ASD score threshold; frames below this skip lip-sync")
     args = parser.parse_args()
+    args.use_lr_asd = not args.disable_lr_asd
     main(args)

@@ -1,0 +1,31 @@
+[Unit]
+Description=MuseTalk Lip-Sync HTTP Service
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=ubuntu
+Group=ubuntu
+WorkingDirectory=/home/ubuntu/raoyonghui/MuseTalk
+
+Environment=PATH=/home/ubuntu/miniconda3/envs/heng/bin:/usr/local/ffmpeg/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
+Environment=LD_LIBRARY_PATH=/usr/local/ffmpeg/lib
+Environment=PYTHONUNBUFFERED=1
+Environment=CUDA_VISIBLE_DEVICES=0
+
+ExecStart=/home/ubuntu/miniconda3/envs/heng/bin/uvicorn server:app --host 0.0.0.0 --port 8765
+ExecStop=/bin/kill -SIGTERM $MAINPID
+
+Restart=on-failure
+RestartSec=15
+TimeoutStartSec=300
+TimeoutStopSec=60
+KillMode=mixed
+
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=muse
+
+[Install]
+WantedBy=multi-user.target

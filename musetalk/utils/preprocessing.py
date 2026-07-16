@@ -12,6 +12,15 @@ from mmpose.structures import merge_data_samples
 import torch
 from tqdm import tqdm
 
+# PyTorch 2.6+ defaults to weights_only=True; allow trusted local checkpoints.
+_original_torch_load = torch.load
+
+def _torch_load(*args, **kwargs):
+    kwargs.setdefault("weights_only", False)
+    return _original_torch_load(*args, **kwargs)
+
+torch.load = _torch_load
+
 # initialize the mmpose model
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 config_file = './musetalk/utils/dwpose/rtmpose-l_8xb32-270e_coco-ubody-wholebody-384x288.py'

@@ -59,7 +59,7 @@ class ServiceConfig:
     right_cheek_width: int = 90
     use_lr_asd: bool = True
     asd_model_path: str = "./third_party/LR-ASD/weight/finetuning_TalkSet.model"
-    asd_threshold: float = -2.0
+    asd_threshold: float = -1.0
     # Expand ASD speaking regions by N frames on each side to reduce flicker/gaps.
     asd_mask_dilate: int = 8
     bbox_shift: int = 0

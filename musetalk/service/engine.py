@@ -15,6 +15,7 @@ from tqdm import tqdm
 from transformers import WhisperModel
 
 from musetalk.service.long_video import (
+    FFmpegRawVideoWriter,
     compute_effective_frame_count,
     compute_segments,
     concat_videos,
@@ -441,21 +442,19 @@ class MuseTalkEngine:
             else:
                 logger.info("No speaking frames to infer; writing original frames")
 
-            logger.info("Compositing frames with VideoWriter (no intermediate PNG)")
+            logger.info("Compositing frames with ffmpeg rawvideo pipe (libx264)")
             lipsync_frames = 0
             height, width = frame_list[0].shape[:2]
-            width_even = width - (width % 2)
-            height_even = height - (height % 2)
-            writer_path = os.path.join(temp_dir, f"temp_{output_basename}_writer.mp4")
             temp_vid_path = os.path.join(temp_dir, f"temp_{output_basename}.mp4")
-            fourcc = cv2.VideoWriter_fourcc(*"mp4v")
-            writer = cv2.VideoWriter(
-                writer_path, fourcc, float(fps), (width_even, height_even)
-            )
-            if not writer.isOpened():
-                raise RuntimeError(f"Failed to open VideoWriter for {writer_path}")
 
-            try:
+            with FFmpegRawVideoWriter(
+                temp_vid_path,
+                width=width,
+                height=height,
+                fps=float(fps),
+                crf=18,
+                preset="veryfast",
+            ) as writer:
                 for i in tqdm(range(video_num)):
                     bbox = coord_list[i]
                     ori_frame = frame_list[i]
@@ -488,22 +487,7 @@ class MuseTalkEngine:
                         except Exception:
                             combine_frame = ori_frame
 
-                    if (
-                        combine_frame.shape[0] != height_even
-                        or combine_frame.shape[1] != width_even
-                    ):
-                        combine_frame = combine_frame[:height_even, :width_even]
                     writer.write(combine_frame)
-            finally:
-                writer.release()
-
-            cmd_reencode = (
-                f"ffmpeg -y -v warning -i {writer_path} "
-                f"-vcodec libx264 -vf format=yuv420p -crf 18 {temp_vid_path}"
-            )
-            ret = os.system(cmd_reencode)
-            if ret != 0:
-                raise RuntimeError(f"ffmpeg re-encode failed with code {ret}")
 
             if audio_mux_source and has_audio_stream(audio_mux_source):
                 logger.info("Muxing original video audio from %s", audio_mux_source)

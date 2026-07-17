@@ -6,10 +6,12 @@ import logging
 import math
 import os
 import subprocess
+import threading
 from dataclasses import dataclass
-from typing import List
+from typing import List, Optional
 
 import cv2
+import numpy as np
 
 from musetalk.service.ffmpeg_env import ensure_ffmpeg_env
 
@@ -409,3 +411,188 @@ def concat_videos(video_paths: List[str], output_path: str) -> None:
     finally:
         if os.path.isfile(list_path):
             os.remove(list_path)
+
+
+class FFmpegRawVideoWriter:
+    """Write BGR frames to libx264 via ffmpeg rawvideo stdin pipe (single encode)."""
+
+    def __init__(
+        self,
+        output_path: str,
+        width: int,
+        height: int,
+        fps: float,
+        *,
+        crf: int = 18,
+        preset: str = "veryfast",
+    ):
+        ensure_ffmpeg_env()
+        self.output_path = output_path
+        self.width = int(width) - (int(width) % 2)
+        self.height = int(height) - (int(height) % 2)
+        if self.width <= 0 or self.height <= 0:
+            raise ValueError(f"Invalid output size: {self.width}x{self.height}")
+        self.fps = float(fps) if fps and fps > 0 else 25.0
+        self.crf = int(crf)
+        self.preset = preset
+        self._proc: Optional[subprocess.Popen] = None
+        self._stderr_thread: Optional[threading.Thread] = None
+        self._stderr_chunks: list[bytes] = []
+        self._closed = False
+        self._frame_bytes = self.width * self.height * 3
+
+    def __enter__(self) -> "FFmpegRawVideoWriter":
+        self.open()
+        return self
+
+    def __exit__(self, exc_type, exc, tb) -> bool:
+        if exc_type is not None:
+            self.abort()
+        else:
+            self.close()
+        return False
+
+    def _stderr_text(self) -> str:
+        return b"".join(self._stderr_chunks).decode("utf-8", errors="replace").strip()
+
+    def open(self) -> None:
+        if self._proc is not None:
+            return
+        os.makedirs(os.path.dirname(self.output_path) or ".", exist_ok=True)
+        cmd = [
+            "ffmpeg",
+            "-y",
+            "-hide_banner",
+            "-loglevel",
+            "error",
+            "-f",
+            "rawvideo",
+            "-pix_fmt",
+            "bgr24",
+            "-s",
+            f"{self.width}x{self.height}",
+            "-r",
+            f"{self.fps:.6f}",
+            "-i",
+            "-",
+            "-an",
+            "-c:v",
+            "libx264",
+            "-pix_fmt",
+            "yuv420p",
+            "-crf",
+            str(self.crf),
+            "-preset",
+            self.preset,
+            "-movflags",
+            "+faststart",
+            self.output_path,
+        ]
+        self._proc = subprocess.Popen(
+            cmd,
+            stdin=subprocess.PIPE,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.PIPE,
+        )
+
+        def _drain_stderr() -> None:
+            assert self._proc is not None and self._proc.stderr is not None
+            try:
+                while True:
+                    chunk = self._proc.stderr.read(4096)
+                    if not chunk:
+                        break
+                    self._stderr_chunks.append(chunk)
+            except Exception:
+                pass
+
+        self._stderr_thread = threading.Thread(target=_drain_stderr, daemon=True)
+        self._stderr_thread.start()
+        logger.info(
+            "ffmpeg rawvideo writer opened: %dx%d @ %.3ffps -> %s",
+            self.width,
+            self.height,
+            self.fps,
+            self.output_path,
+        )
+
+    def write(self, frame: np.ndarray) -> None:
+        if self._proc is None or self._proc.stdin is None:
+            raise RuntimeError("FFmpegRawVideoWriter is not open")
+        if frame.ndim != 3 or frame.shape[2] != 3:
+            raise ValueError(f"Expected HxWx3 BGR frame, got shape={frame.shape}")
+        if frame.shape[0] != self.height or frame.shape[1] != self.width:
+            frame = frame[: self.height, : self.width]
+        if frame.dtype != np.uint8:
+            frame = frame.astype(np.uint8, copy=False)
+        if not frame.flags["C_CONTIGUOUS"]:
+            frame = np.ascontiguousarray(frame)
+        payload = frame.tobytes()
+        if len(payload) != self._frame_bytes:
+            raise ValueError(
+                f"Frame byte size mismatch: got {len(payload)}, expected {self._frame_bytes}"
+            )
+        try:
+            self._proc.stdin.write(payload)
+        except BrokenPipeError as exc:
+            err = self._stderr_text()
+            raise RuntimeError(f"ffmpeg stdin pipe broken while writing: {err or exc}") from exc
+
+    def close(self) -> None:
+        if self._closed:
+            return
+        self._closed = True
+        if self._proc is None:
+            return
+
+        ret = -1
+        try:
+            if self._proc.stdin is not None:
+                try:
+                    self._proc.stdin.close()
+                except Exception:
+                    pass
+            try:
+                ret = self._proc.wait(timeout=600)
+            except subprocess.TimeoutExpired:
+                self._proc.kill()
+                self._proc.wait(timeout=30)
+                raise RuntimeError("ffmpeg encode timed out after closing stdin")
+        finally:
+            if self._stderr_thread is not None:
+                self._stderr_thread.join(timeout=5)
+
+        if ret != 0:
+            err = self._stderr_text()
+            if os.path.isfile(self.output_path):
+                try:
+                    os.remove(self.output_path)
+                except OSError:
+                    pass
+            raise RuntimeError(f"ffmpeg exited with code {ret}: {err or 'no stderr'}")
+
+    def abort(self) -> None:
+        """Best-effort kill and remove incomplete output."""
+        self._closed = True
+        if self._proc is not None:
+            try:
+                if self._proc.stdin is not None:
+                    try:
+                        self._proc.stdin.close()
+                    except Exception:
+                        pass
+                if self._proc.poll() is None:
+                    self._proc.kill()
+                    try:
+                        self._proc.wait(timeout=15)
+                    except Exception:
+                        pass
+            finally:
+                if self._stderr_thread is not None:
+                    self._stderr_thread.join(timeout=2)
+                self._proc = None
+        if os.path.isfile(self.output_path):
+            try:
+                os.remove(self.output_path)
+            except OSError:
+                pass

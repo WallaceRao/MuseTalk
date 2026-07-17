@@ -65,6 +65,8 @@ class ServiceConfig:
     chunk_duration_sec: float = 60.0
     # Detect face bbox every N frames; intermediates are linearly interpolated.
     bbox_detect_stride: int = 3
+    # Downscale for detection when short side exceeds this; <= threshold keeps original.
+    detect_short_side: int = 720
     # Max simultaneous inference jobs (one engine instance per slot).
     max_concurrent_requests: int = 1
     # Optional per-slot GPU assignment, e.g. [0, 1]. Cycles when slots > len(gpu_ids).
@@ -332,14 +334,16 @@ class MuseTalkEngine:
             )
 
             logger.info(
-                "Extracting landmarks for %d frames (detect_stride=%d)",
+                "Extracting landmarks for %d frames (detect_stride=%d, detect_short_side=%d)",
                 len(frame_list),
                 cfg.bbox_detect_stride,
+                cfg.detect_short_side,
             )
             coord_list, frame_list = get_landmark_and_bbox(
                 upperbondrange=bbox_shift,
                 detect_stride=cfg.bbox_detect_stride,
                 frames=frame_list,
+                detect_short_side=cfg.detect_short_side,
             )
 
             video_num = min(len(whisper_chunks), len(frame_list))

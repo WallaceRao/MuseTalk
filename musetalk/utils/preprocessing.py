@@ -90,15 +90,50 @@ def get_bbox_range(img_list,upperbondrange =0):
     return text_range
     
 
-def _detect_bbox_for_frame(frame, upperbondrange=0):
-    """Run DWPose + face detection on a single frame. Returns (bbox, range_minus, range_plus)."""
-    results = inference_topdown(model, frame)
+def _resize_for_detection(frame, detect_short_side=720):
+    """
+    Downscale frame for detection when short side exceeds detect_short_side.
+    Small/equal resolution frames are returned unchanged (scale 1.0).
+    Returns (detect_frame, scale_x, scale_y) to map detect coords back to original.
+    """
+    h, w = frame.shape[:2]
+    short = min(h, w)
+    if detect_short_side is None or detect_short_side <= 0 or short <= detect_short_side:
+        return frame, 1.0, 1.0
+
+    scale = float(detect_short_side) / float(short)
+    new_w = max(1, int(round(w * scale)))
+    new_h = max(1, int(round(h * scale)))
+    resized = cv2.resize(frame, (new_w, new_h), interpolation=cv2.INTER_AREA)
+    return resized, w / float(new_w), h / float(new_h)
+
+
+def _scale_bbox_to_original(bbox, scale_x, scale_y):
+    if bbox == coord_placeholder or (scale_x == 1.0 and scale_y == 1.0):
+        return bbox
+    x1, y1, x2, y2 = bbox
+    return (
+        int(round(x1 * scale_x)),
+        int(round(y1 * scale_y)),
+        int(round(x2 * scale_x)),
+        int(round(y2 * scale_y)),
+    )
+
+
+def _detect_bbox_for_frame(frame, upperbondrange=0, detect_short_side=720):
+    """Run DWPose + face detection on a single frame. Returns (bbox, range_minus, range_plus).
+
+    Bbox coordinates are always in the original frame space.
+    """
+    detect_frame, scale_x, scale_y = _resize_for_detection(frame, detect_short_side)
+
+    results = inference_topdown(model, detect_frame)
     results = merge_data_samples(results)
     keypoints = results.pred_instances.keypoints
     face_land_mark = keypoints[0][23:91]
     face_land_mark = face_land_mark.astype(np.int32)
 
-    bbox = fa.get_detections_for_batch(np.asarray([frame]))
+    bbox = fa.get_detections_for_batch(np.asarray([detect_frame]))
     f = bbox[0]
     if f is None:
         return coord_placeholder, None, None
@@ -107,7 +142,8 @@ def _detect_bbox_for_frame(frame, upperbondrange=0):
     range_minus = (face_land_mark[30] - face_land_mark[29])[1]
     range_plus = (face_land_mark[29] - face_land_mark[28])[1]
     if upperbondrange != 0:
-        half_face_coord[1] = upperbondrange + half_face_coord[1]
+        # upperbondrange is specified in original-frame pixels
+        half_face_coord[1] = half_face_coord[1] + int(round(upperbondrange / scale_y))
     half_face_dist = np.max(face_land_mark[:, 1]) - half_face_coord[1]
     upper_bond = max(0, half_face_coord[1] - half_face_dist)
 
@@ -119,9 +155,15 @@ def _detect_bbox_for_frame(frame, upperbondrange=0):
     )
     x1, y1, x2, y2 = f_landmark
     if y2 - y1 <= 0 or x2 - x1 <= 0 or x1 < 0:
-        print("error bbox:", f)
-        return f, range_minus, range_plus
-    return f_landmark, range_minus, range_plus
+        print("error bbox:", _scale_bbox_to_original(f, scale_x, scale_y))
+        out_bbox = _scale_bbox_to_original(f, scale_x, scale_y)
+    else:
+        out_bbox = _scale_bbox_to_original(f_landmark, scale_x, scale_y)
+
+    if range_minus is not None:
+        range_minus = float(range_minus) * scale_y
+        range_plus = float(range_plus) * scale_y
+    return out_bbox, range_minus, range_plus
 
 
 def _lerp_bbox(b0, b1, t):
@@ -155,12 +197,21 @@ def _interpolate_sparse_coords(sparse_coords, n_frames):
     return result
 
 
-def get_landmark_and_bbox(img_list=None, upperbondrange=0, detect_stride=3, frames=None):
+def get_landmark_and_bbox(
+    img_list=None,
+    upperbondrange=0,
+    detect_stride=3,
+    frames=None,
+    detect_short_side=720,
+):
     """
     Detect face bboxes. When detect_stride > 1, only every N-th frame (and the
     last frame) is detected; intermediate frames use linear bbox interpolation.
 
     Pass either img_list (paths) or frames (already decoded BGR arrays).
+    When frame short side > detect_short_side, detection runs on a downscaled
+    copy and bboxes are mapped back to original coordinates. Frames already
+    at or below detect_short_side are unchanged.
     """
     if frames is None:
         if not img_list:
@@ -176,6 +227,20 @@ def get_landmark_and_bbox(img_list=None, upperbondrange=0, detect_stride=3, fram
     if detect_stride > 1:
         print(f'bbox detect_stride={detect_stride} (intermediate frames interpolated)')
 
+    if n_frames > 0 and detect_short_side and detect_short_side > 0:
+        h0, w0 = frames[0].shape[:2]
+        short0 = min(h0, w0)
+        if short0 > detect_short_side:
+            print(
+                f'detect_short_side={detect_short_side}: '
+                f'downscale {w0}x{h0} (short={short0}) for detection'
+            )
+        else:
+            print(
+                f'detect_short_side={detect_short_side}: '
+                f'keep original {w0}x{h0} (short={short0} <= threshold)'
+            )
+
     sparse_coords = [None] * n_frames
     average_range_minus = []
     average_range_plus = []
@@ -185,7 +250,11 @@ def get_landmark_and_bbox(img_list=None, upperbondrange=0, detect_stride=3, fram
         detect_indices.append(n_frames - 1)
 
     for idx in tqdm(detect_indices):
-        bbox, range_minus, range_plus = _detect_bbox_for_frame(frames[idx], upperbondrange)
+        bbox, range_minus, range_plus = _detect_bbox_for_frame(
+            frames[idx],
+            upperbondrange,
+            detect_short_side=detect_short_side,
+        )
         sparse_coords[idx] = bbox
         if range_minus is not None:
             average_range_minus.append(range_minus)

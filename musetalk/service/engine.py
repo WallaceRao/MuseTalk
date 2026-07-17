@@ -18,6 +18,7 @@ from musetalk.service.long_video import (
     compute_effective_frame_count,
     compute_segments,
     concat_videos,
+    decode_video_frames,
     has_audio_stream,
     mux_video_with_source_audio,
     probe_duration,
@@ -29,8 +30,8 @@ from musetalk.utils.active_speaker import LRASDDetector
 from musetalk.utils.audio_processor import AudioProcessor
 from musetalk.utils.blending import get_image
 from musetalk.utils.face_parsing import FaceParsing
-from musetalk.utils.preprocessing import coord_placeholder, get_landmark_and_bbox, read_imgs
-from musetalk.utils.utils import datagen, get_file_type, get_video_fps, load_all_model
+from musetalk.utils.preprocessing import coord_placeholder, get_landmark_and_bbox
+from musetalk.utils.utils import datagen, get_file_type, load_all_model
 
 from musetalk.service.ffmpeg_env import ensure_ffmpeg_env, ensure_ffmpeg_ready
 
@@ -62,6 +63,8 @@ class ServiceConfig:
     # Long video: auto-chunk when duration exceeds threshold (seconds).
     auto_chunk_threshold_sec: float = 120.0
     chunk_duration_sec: float = 60.0
+    # Detect face bbox every N frames; intermediates are linearly interpolated.
+    bbox_detect_stride: int = 3
     # Max simultaneous inference jobs (one engine instance per slot).
     max_concurrent_requests: int = 1
     # Optional per-slot GPU assignment, e.g. [0, 1]. Cycles when slots > len(gpu_ids).
@@ -288,30 +291,31 @@ class MuseTalkEngine:
             audio_basename = os.path.splitext(os.path.basename(audio_path))[0]
             output_basename = f"{input_basename}_{audio_basename}"
 
-            result_img_save_path = os.path.join(temp_dir, output_basename)
-            os.makedirs(result_img_save_path, exist_ok=True)
-
-            save_dir_full = None
             file_type = get_file_type(video_path)
             if file_type == "video":
-                save_dir_full = os.path.join(temp_dir, input_basename)
-                os.makedirs(save_dir_full, exist_ok=True)
-                cmd = f"ffmpeg -v fatal -y -i {video_path} -start_number 0 {save_dir_full}/%08d.png"
-                ret = os.system(cmd)
-                if ret != 0:
-                    raise RuntimeError(f"ffmpeg frame extraction failed with code {ret}")
-                input_img_list = sorted(glob.glob(os.path.join(save_dir_full, "*.png")))
-                fps = get_video_fps(video_path)
+                logger.info("Decoding video frames into memory: %s", video_path)
+                frame_list, fps = decode_video_frames(video_path)
             elif file_type == "image":
-                input_img_list = [video_path]
-                fps = cfg.fps
+                frame = cv2.imread(video_path)
+                if frame is None:
+                    raise RuntimeError(f"Failed to read image: {video_path}")
+                frame_list = [frame]
+                fps = float(cfg.fps)
             elif os.path.isdir(video_path):
                 input_img_list = glob.glob(os.path.join(video_path, "*.png"))
                 input_img_list = sorted(
                     input_img_list,
                     key=lambda x: int(os.path.splitext(os.path.basename(x))[0]),
                 )
-                fps = cfg.fps
+                if not input_img_list:
+                    raise ValueError(f"No PNG frames found in directory: {video_path}")
+                frame_list = []
+                for path in tqdm(input_img_list, desc="reading images"):
+                    frame = cv2.imread(path)
+                    if frame is None:
+                        raise RuntimeError(f"Failed to read frame: {path}")
+                    frame_list.append(frame)
+                fps = float(cfg.fps)
             else:
                 raise ValueError(f"Unsupported video input: {video_path}")
 
@@ -327,32 +331,21 @@ class MuseTalkEngine:
                 audio_padding_length_right=cfg.audio_padding_length_right,
             )
 
-            logger.info("Extracting landmarks for %d frames", len(input_img_list))
-            coord_list, frame_list = get_landmark_and_bbox(input_img_list, bbox_shift)
+            logger.info(
+                "Extracting landmarks for %d frames (detect_stride=%d)",
+                len(frame_list),
+                cfg.bbox_detect_stride,
+            )
+            coord_list, frame_list = get_landmark_and_bbox(
+                upperbondrange=bbox_shift,
+                detect_stride=cfg.bbox_detect_stride,
+                frames=frame_list,
+            )
 
-            input_latent_list = [None] * len(frame_list)
-            last_valid_latent = None
-            for i, (bbox, frame) in enumerate(zip(coord_list, frame_list)):
-                if bbox == coord_placeholder:
-                    if last_valid_latent is not None:
-                        input_latent_list[i] = last_valid_latent
-                    continue
-                x1, y1, x2, y2 = bbox
-                if cfg.version == "v15":
-                    y2 = y2 + cfg.extra_margin
-                    y2 = min(y2, frame.shape[0])
-                crop_frame = frame[y1:y2, x1:x2]
-                crop_frame = cv2.resize(crop_frame, (256, 256), interpolation=cv2.INTER_LANCZOS4)
-                latents = self.vae.get_latents_for_unet(crop_frame)
-                input_latent_list[i] = latents
-                last_valid_latent = latents
-
-            first_valid_latent = next((latent for latent in input_latent_list if latent is not None), None)
-            if first_valid_latent is None:
-                raise ValueError("No valid face detected in the input video")
-            for i, latent in enumerate(input_latent_list):
-                if latent is None:
-                    input_latent_list[i] = first_valid_latent
+            video_num = min(len(whisper_chunks), len(frame_list))
+            whisper_chunks = whisper_chunks[:video_num]
+            coord_list = coord_list[:video_num]
+            frame_list = frame_list[:video_num]
 
             speaking_mask = None
             speaking_frames = 0
@@ -364,6 +357,7 @@ class MuseTalkEngine:
                     coord_list=coord_list,
                     fps=fps,
                 )
+                speaking_mask = speaking_mask[:video_num]
                 speaking_frames = sum(speaking_mask)
                 logger.info(
                     "LR-ASD: %d/%d frames marked as speaking (threshold=%s)",
@@ -371,83 +365,141 @@ class MuseTalkEngine:
                     len(speaking_mask),
                     cfg.asd_threshold,
                 )
+            else:
+                speaking_mask = [True] * video_num
+                speaking_frames = video_num
 
-            frame_list_cycle = frame_list + frame_list[::-1]
-            coord_list_cycle = coord_list + coord_list[::-1]
-            input_latent_list_cycle = input_latent_list + input_latent_list[::-1]
-
-            video_num = min(len(whisper_chunks), len(frame_list))
-            whisper_chunks = whisper_chunks[:video_num]
-            gen = datagen(
-                whisper_chunks=whisper_chunks,
-                vae_encode_latents=input_latent_list_cycle,
-                batch_size=cfg.batch_size,
-                delay_frame=0,
-                device=self.device,
-            )
-
-            res_frame_list = []
-            total = int(np.ceil(float(video_num) / cfg.batch_size))
-            logger.info("Starting MuseTalk inference for %d frames", video_num)
-            for _, (whisper_batch, latent_batch) in enumerate(tqdm(gen, total=total)):
-                audio_feature_batch = self.pe(whisper_batch)
-                latent_batch = latent_batch.to(dtype=self.unet.model.dtype)
-                pred_latents = self.unet.model(
-                    latent_batch, self.timesteps, encoder_hidden_states=audio_feature_batch
-                ).sample
-                recon = self.vae.decode_latents(pred_latents)
-                for res_frame in recon:
-                    res_frame_list.append(res_frame)
-
-            logger.info("Padding generated images to original video size")
-            lipsync_frames = 0
-            for i, res_frame in enumerate(tqdm(res_frame_list)):
-                frame_idx = i % len(frame_list_cycle)
-                bbox = coord_list_cycle[frame_idx]
-                ori_frame = copy.deepcopy(frame_list_cycle[frame_idx])
+            infer_indices = []
+            for i in range(video_num):
+                if not speaking_mask[i]:
+                    continue
+                bbox = coord_list[i]
+                if bbox == coord_placeholder:
+                    continue
                 x1, y1, x2, y2 = bbox
                 if cfg.version == "v15":
-                    y2 = y2 + cfg.extra_margin
-                    y2 = min(y2, ori_frame.shape[0])
+                    y2 = min(y2 + cfg.extra_margin, frame_list[i].shape[0])
+                if x2 <= x1 or y2 <= y1:
+                    continue
+                infer_indices.append(i)
 
-                should_lipsync = True
-                if cfg.use_lr_asd and speaking_mask is not None:
-                    should_lipsync = speaking_mask[frame_idx % len(speaking_mask)]
+            if not infer_indices and not any(b != coord_placeholder for b in coord_list):
+                raise ValueError("No valid face detected in the input video")
 
-                if (
-                    not should_lipsync
-                    or bbox == coord_placeholder
-                    or x2 <= x1
-                    or y2 <= y1
-                ):
-                    combine_frame = ori_frame
-                else:
-                    try:
-                        res_frame = cv2.resize(res_frame.astype(np.uint8), (x2 - x1, y2 - y1))
-                        if cfg.version == "v15":
-                            combine_frame = get_image(
-                                ori_frame,
-                                res_frame,
-                                [x1, y1, x2, y2],
-                                mode=cfg.parsing_mode,
-                                fp=self.fp,
-                            )
-                        else:
-                            combine_frame = get_image(ori_frame, res_frame, [x1, y1, x2, y2], fp=self.fp)
-                        lipsync_frames += 1
-                    except Exception:
-                        combine_frame = ori_frame
+            res_by_index: dict[int, np.ndarray] = {}
+            if infer_indices:
+                logger.info(
+                    "Encoding latents for %d speaking frames (skipped %d)",
+                    len(infer_indices),
+                    video_num - len(infer_indices),
+                )
+                infer_latents = []
+                infer_whisper = []
+                for i in infer_indices:
+                    bbox = coord_list[i]
+                    x1, y1, x2, y2 = bbox
+                    if cfg.version == "v15":
+                        y2 = min(y2 + cfg.extra_margin, frame_list[i].shape[0])
+                    crop_frame = frame_list[i][y1:y2, x1:x2]
+                    crop_frame = cv2.resize(
+                        crop_frame, (256, 256), interpolation=cv2.INTER_LANCZOS4
+                    )
+                    infer_latents.append(self.vae.get_latents_for_unet(crop_frame))
+                    infer_whisper.append(whisper_chunks[i])
 
-                cv2.imwrite(f"{result_img_save_path}/{str(i).zfill(8)}.png", combine_frame)
+                gen = datagen(
+                    whisper_chunks=infer_whisper,
+                    vae_encode_latents=infer_latents,
+                    batch_size=cfg.batch_size,
+                    delay_frame=0,
+                    device=self.device,
+                )
+                total = int(np.ceil(float(len(infer_indices)) / cfg.batch_size))
+                logger.info(
+                    "Starting MuseTalk inference for %d/%d frames",
+                    len(infer_indices),
+                    video_num,
+                )
+                produced = []
+                for _, (whisper_batch, latent_batch) in enumerate(tqdm(gen, total=total)):
+                    audio_feature_batch = self.pe(whisper_batch)
+                    latent_batch = latent_batch.to(dtype=self.unet.model.dtype)
+                    pred_latents = self.unet.model(
+                        latent_batch,
+                        self.timesteps,
+                        encoder_hidden_states=audio_feature_batch,
+                    ).sample
+                    recon = self.vae.decode_latents(pred_latents)
+                    for res_frame in recon:
+                        produced.append(res_frame)
+                for idx, res_frame in zip(infer_indices, produced):
+                    res_by_index[idx] = res_frame
+            else:
+                logger.info("No speaking frames to infer; writing original frames")
 
+            logger.info("Compositing frames with VideoWriter (no intermediate PNG)")
+            lipsync_frames = 0
+            height, width = frame_list[0].shape[:2]
+            width_even = width - (width % 2)
+            height_even = height - (height % 2)
+            writer_path = os.path.join(temp_dir, f"temp_{output_basename}_writer.mp4")
             temp_vid_path = os.path.join(temp_dir, f"temp_{output_basename}.mp4")
-            cmd_img2video = (
-                f"ffmpeg -y -v warning -r {fps} -f image2 -i {result_img_save_path}/%08d.png "
+            fourcc = cv2.VideoWriter_fourcc(*"mp4v")
+            writer = cv2.VideoWriter(
+                writer_path, fourcc, float(fps), (width_even, height_even)
+            )
+            if not writer.isOpened():
+                raise RuntimeError(f"Failed to open VideoWriter for {writer_path}")
+
+            try:
+                for i in tqdm(range(video_num)):
+                    bbox = coord_list[i]
+                    ori_frame = frame_list[i]
+                    x1, y1, x2, y2 = bbox
+                    if cfg.version == "v15":
+                        y2 = min(y2 + cfg.extra_margin, ori_frame.shape[0])
+
+                    res_frame = res_by_index.get(i)
+                    if res_frame is None:
+                        combine_frame = ori_frame
+                    else:
+                        try:
+                            ori_copy = copy.deepcopy(ori_frame)
+                            res_frame = cv2.resize(
+                                res_frame.astype(np.uint8), (x2 - x1, y2 - y1)
+                            )
+                            if cfg.version == "v15":
+                                combine_frame = get_image(
+                                    ori_copy,
+                                    res_frame,
+                                    [x1, y1, x2, y2],
+                                    mode=cfg.parsing_mode,
+                                    fp=self.fp,
+                                )
+                            else:
+                                combine_frame = get_image(
+                                    ori_copy, res_frame, [x1, y1, x2, y2], fp=self.fp
+                                )
+                            lipsync_frames += 1
+                        except Exception:
+                            combine_frame = ori_frame
+
+                    if (
+                        combine_frame.shape[0] != height_even
+                        or combine_frame.shape[1] != width_even
+                    ):
+                        combine_frame = combine_frame[:height_even, :width_even]
+                    writer.write(combine_frame)
+            finally:
+                writer.release()
+
+            cmd_reencode = (
+                f"ffmpeg -y -v warning -i {writer_path} "
                 f"-vcodec libx264 -vf format=yuv420p -crf 18 {temp_vid_path}"
             )
-            ret = os.system(cmd_img2video)
+            ret = os.system(cmd_reencode)
             if ret != 0:
-                raise RuntimeError(f"ffmpeg image2video failed with code {ret}")
+                raise RuntimeError(f"ffmpeg re-encode failed with code {ret}")
 
             if audio_mux_source and has_audio_stream(audio_mux_source):
                 logger.info("Muxing original video audio from %s", audio_mux_source)

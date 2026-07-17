@@ -9,6 +9,8 @@ import subprocess
 from dataclasses import dataclass
 from typing import List
 
+import cv2
+
 from musetalk.service.ffmpeg_env import ensure_ffmpeg_env
 
 logger = logging.getLogger("musetalk_service")
@@ -38,6 +40,25 @@ def _parse_fps(rate: str) -> float:
         num, den = rate.split("/", 1)
         return float(num) / float(den)
     return float(rate)
+
+
+def decode_video_frames(video_path: str) -> tuple[list, float]:
+    """Decode all video frames into memory (BGR), return (frames, fps)."""
+    ensure_ffmpeg_env()
+    cap = cv2.VideoCapture(video_path)
+    if not cap.isOpened():
+        raise RuntimeError(f"Failed to open video: {video_path}")
+    fps = float(cap.get(cv2.CAP_PROP_FPS) or 25.0)
+    frames = []
+    while True:
+        ok, frame = cap.read()
+        if not ok:
+            break
+        frames.append(frame)
+    cap.release()
+    if not frames:
+        raise RuntimeError(f"No frames decoded from video: {video_path}")
+    return frames, fps
 
 
 def probe_duration(path: str) -> float:

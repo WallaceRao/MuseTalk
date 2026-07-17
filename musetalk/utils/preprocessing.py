@@ -90,60 +90,125 @@ def get_bbox_range(img_list,upperbondrange =0):
     return text_range
     
 
-def get_landmark_and_bbox(img_list,upperbondrange =0):
-    frames = read_imgs(img_list)
-    batch_size_fa = 1
-    batches = [frames[i:i + batch_size_fa] for i in range(0, len(frames), batch_size_fa)]
-    coords_list = []
-    landmarks = []
+def _detect_bbox_for_frame(frame, upperbondrange=0):
+    """Run DWPose + face detection on a single frame. Returns (bbox, range_minus, range_plus)."""
+    results = inference_topdown(model, frame)
+    results = merge_data_samples(results)
+    keypoints = results.pred_instances.keypoints
+    face_land_mark = keypoints[0][23:91]
+    face_land_mark = face_land_mark.astype(np.int32)
+
+    bbox = fa.get_detections_for_batch(np.asarray([frame]))
+    f = bbox[0]
+    if f is None:
+        return coord_placeholder, None, None
+
+    half_face_coord = face_land_mark[29].copy()
+    range_minus = (face_land_mark[30] - face_land_mark[29])[1]
+    range_plus = (face_land_mark[29] - face_land_mark[28])[1]
     if upperbondrange != 0:
-        print('get key_landmark and face bounding boxes with the bbox_shift:',upperbondrange)
+        half_face_coord[1] = upperbondrange + half_face_coord[1]
+    half_face_dist = np.max(face_land_mark[:, 1]) - half_face_coord[1]
+    upper_bond = max(0, half_face_coord[1] - half_face_dist)
+
+    f_landmark = (
+        np.min(face_land_mark[:, 0]),
+        int(upper_bond),
+        np.max(face_land_mark[:, 0]),
+        np.max(face_land_mark[:, 1]),
+    )
+    x1, y1, x2, y2 = f_landmark
+    if y2 - y1 <= 0 or x2 - x1 <= 0 or x1 < 0:
+        print("error bbox:", f)
+        return f, range_minus, range_plus
+    return f_landmark, range_minus, range_plus
+
+
+def _lerp_bbox(b0, b1, t):
+    if b0 == coord_placeholder or b1 == coord_placeholder:
+        return b0 if t < 0.5 else b1
+    return tuple(int(round(b0[j] + (b1[j] - b0[j]) * t)) for j in range(4))
+
+
+def _interpolate_sparse_coords(sparse_coords, n_frames):
+    """Fill None slots by linear interpolation between detected keyframes."""
+    result = [coord_placeholder] * n_frames
+    key_idxs = [i for i, c in enumerate(sparse_coords) if c is not None]
+    if not key_idxs:
+        return result
+
+    first = key_idxs[0]
+    for i in range(first):
+        result[i] = sparse_coords[first]
+
+    for k, i0 in enumerate(key_idxs):
+        result[i0] = sparse_coords[i0]
+        if k + 1 >= len(key_idxs):
+            for i in range(i0 + 1, n_frames):
+                result[i] = sparse_coords[i0]
+            break
+        i1 = key_idxs[k + 1]
+        b0, b1 = sparse_coords[i0], sparse_coords[i1]
+        span = i1 - i0
+        for i in range(i0 + 1, i1):
+            result[i] = _lerp_bbox(b0, b1, (i - i0) / span)
+    return result
+
+
+def get_landmark_and_bbox(img_list=None, upperbondrange=0, detect_stride=3, frames=None):
+    """
+    Detect face bboxes. When detect_stride > 1, only every N-th frame (and the
+    last frame) is detected; intermediate frames use linear bbox interpolation.
+
+    Pass either img_list (paths) or frames (already decoded BGR arrays).
+    """
+    if frames is None:
+        if not img_list:
+            raise ValueError("Either img_list or frames must be provided")
+        frames = read_imgs(img_list)
+    n_frames = len(frames)
+    detect_stride = max(1, int(detect_stride))
+
+    if upperbondrange != 0:
+        print('get key_landmark and face bounding boxes with the bbox_shift:', upperbondrange)
     else:
         print('get key_landmark and face bounding boxes with the default value')
+    if detect_stride > 1:
+        print(f'bbox detect_stride={detect_stride} (intermediate frames interpolated)')
+
+    sparse_coords = [None] * n_frames
     average_range_minus = []
     average_range_plus = []
-    for fb in tqdm(batches):
-        results = inference_topdown(model, np.asarray(fb)[0])
-        results = merge_data_samples(results)
-        keypoints = results.pred_instances.keypoints
-        face_land_mark= keypoints[0][23:91]
-        face_land_mark = face_land_mark.astype(np.int32)
-        
-        # get bounding boxes by face detetion
-        bbox = fa.get_detections_for_batch(np.asarray(fb))
-        
-        # adjust the bounding box refer to landmark
-        # Add the bounding box to a tuple and append it to the coordinates list
-        for j, f in enumerate(bbox):
-            if f is None: # no face in the image
-                coords_list += [coord_placeholder]
-                continue
-            
-            half_face_coord =  face_land_mark[29]#np.mean([face_land_mark[28], face_land_mark[29]], axis=0)
-            range_minus = (face_land_mark[30]- face_land_mark[29])[1]
-            range_plus = (face_land_mark[29]- face_land_mark[28])[1]
+
+    detect_indices = list(range(0, n_frames, detect_stride))
+    if n_frames > 0 and (n_frames - 1) not in detect_indices:
+        detect_indices.append(n_frames - 1)
+
+    for idx in tqdm(detect_indices):
+        bbox, range_minus, range_plus = _detect_bbox_for_frame(frames[idx], upperbondrange)
+        sparse_coords[idx] = bbox
+        if range_minus is not None:
             average_range_minus.append(range_minus)
             average_range_plus.append(range_plus)
-            if upperbondrange != 0:
-                half_face_coord[1] = upperbondrange+half_face_coord[1] #手动调整  + 向下（偏29）  - 向上（偏28）
-            half_face_dist = np.max(face_land_mark[:,1]) - half_face_coord[1]
-            min_upper_bond = 0
-            upper_bond = max(min_upper_bond, half_face_coord[1] - half_face_dist)
-            
-            f_landmark = (np.min(face_land_mark[:, 0]),int(upper_bond),np.max(face_land_mark[:, 0]),np.max(face_land_mark[:,1]))
-            x1, y1, x2, y2 = f_landmark
-            
-            if y2-y1<=0 or x2-x1<=0 or x1<0: # if the landmark bbox is not suitable, reuse the bbox
-                coords_list += [f]
-                w,h = f[2]-f[0], f[3]-f[1]
-                print("error bbox:",f)
-            else:
-                coords_list += [f_landmark]
-    
+
+    coords_list = (
+        sparse_coords
+        if detect_stride == 1
+        else _interpolate_sparse_coords(sparse_coords, n_frames)
+    )
+
     print("********************************************bbox_shift parameter adjustment**********************************************************")
-    print(f"Total frame:「{len(frames)}」 Manually adjust range : [ -{int(sum(average_range_minus) / len(average_range_minus))}~{int(sum(average_range_plus) / len(average_range_plus))} ] , the current value: {upperbondrange}")
+    if average_range_minus:
+        print(
+            f"Total frame:「{n_frames}」 Manually adjust range : "
+            f"[ -{int(sum(average_range_minus) / len(average_range_minus))}"
+            f"~{int(sum(average_range_plus) / len(average_range_plus))} ] , "
+            f"the current value: {upperbondrange}"
+        )
+    else:
+        print(f"Total frame:「{n_frames}」 No valid face ranges, current value: {upperbondrange}")
     print("*************************************************************************************************************************************")
-    return coords_list,frames
+    return coords_list, frames
     
 
 if __name__ == "__main__":

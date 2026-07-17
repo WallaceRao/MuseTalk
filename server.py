@@ -28,6 +28,26 @@ def _load_service_config() -> ServiceConfig:
     if gpu_ids_env:
         config.gpu_ids = [int(x.strip()) for x in gpu_ids_env.split(",") if x.strip()]
 
+    use_cf = os.environ.get("MUSETALK_USE_CODEFORMER")
+    if use_cf is not None:
+        config.use_codeformer = use_cf.strip().lower() in {"1", "true", "yes", "on"}
+
+    fidelity = os.environ.get("MUSETALK_CODEFORMER_FIDELITY")
+    if fidelity is not None:
+        config.codeformer_fidelity = float(fidelity)
+
+    cf_path = os.environ.get("MUSETALK_CODEFORMER_MODEL")
+    if cf_path:
+        config.codeformer_model_path = cf_path
+
+    dilate = os.environ.get("MUSETALK_ASD_MASK_DILATE")
+    if dilate is not None:
+        config.asd_mask_dilate = max(0, int(dilate))
+
+    asd_threshold = os.environ.get("MUSETALK_ASD_THRESHOLD")
+    if asd_threshold is not None:
+        config.asd_threshold = float(asd_threshold)
+
     return config
 
 

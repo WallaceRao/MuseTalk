@@ -38,6 +38,17 @@ cd /home/ubuntu/raoyonghui/MuseTalk
 | Face Parsing | `models/face-parse-bisent/` |
 | SyncNet | `models/syncnet/latentsync_syncnet.pt` |
 | LR-ASD 说话人检测 | `third_party/LR-ASD/weight/finetuning_TalkSet.model` |
+| CodeFormer 人脸修复 | `models/codeformer/codeformer.pth` |
+
+若缺少 CodeFormer 权重，可从官方 Release 下载（约 360MB）：
+
+```bash
+mkdir -p models/codeformer
+aria2c -x 16 -s 16 -k 1M -d models/codeformer -o codeformer.pth \
+  "https://ghproxy.net/https://github.com/sczhou/CodeFormer/releases/download/v0.1.0/codeformer.pth"
+```
+
+源码位于 `third_party/CodeFormer/`（仅对人脸 crop 推理，无需再跑官方检测流程）。
 
 HTTP 服务默认使用 **v1.5**，对应配置见 `musetalk/service/engine.py` 中的 `ServiceConfig`。
 
@@ -115,8 +126,15 @@ uvicorn server:app --host 0.0.0.0 --port 8765
 |------|------|------|
 | `MUSETALK_MAX_CONCURRENT` | 最大并发推理数 | `1` |
 | `MUSETALK_GPU_IDS` | 各引擎槽位 GPU，如 `0,1` | 未设置则用 `gpu_id=0` |
+| `MUSETALK_USE_CODEFORMER` | 是否对人脸生成结果做 CodeFormer 修复 | `true` |
+| `MUSETALK_CODEFORMER_FIDELITY` | 保真度 `0~1`（越高越接近原脸） | `0.7` |
+| `MUSETALK_CODEFORMER_MODEL` | CodeFormer 权重路径 | `./models/codeformer/codeformer.pth` |
+| `MUSETALK_ASD_MASK_DILATE` | speaking mask 前后各膨胀帧数 | `8` |
+| `MUSETALK_ASD_THRESHOLD` | LR-ASD 分数阈值（logit，越低越宽松） | `0.0` |
 
 单卡建议保持 `MUSETALK_MAX_CONCURRENT=1`；短视频可尝试 `2`，长视频不建议。
+
+CodeFormer 仅作用于 **LR-ASD 判定为说话、且已生成口型的人脸 crop**；失败时自动回退到未修复人脸。权重缺失时服务仍可启动，但会跳过修复。
 
 ---
 

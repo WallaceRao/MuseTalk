@@ -21,3 +21,9 @@ moviepy
 python_speech_features
 fastapi
 uvicorn[standard]
+
+# CodeFormer face restoration (vendored under third_party/CodeFormer)
+lpips
+future
+lmdb
+scikit-image

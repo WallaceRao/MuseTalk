@@ -27,7 +27,7 @@ from musetalk.service.long_video import (
     split_video_segment_frames_with_validation,
     validate_frame_count,
 )
-from musetalk.utils.active_speaker import LRASDDetector
+from musetalk.utils.active_speaker import LRASDDetector, dilate_speaking_mask
 from musetalk.utils.audio_processor import AudioProcessor
 from musetalk.utils.blending import get_image
 from musetalk.utils.face_parsing import FaceParsing
@@ -59,7 +59,9 @@ class ServiceConfig:
     right_cheek_width: int = 90
     use_lr_asd: bool = True
     asd_model_path: str = "./third_party/LR-ASD/weight/finetuning_TalkSet.model"
-    asd_threshold: float = 0.0
+    asd_threshold: float = -2.0
+    # Expand ASD speaking regions by N frames on each side to reduce flicker/gaps.
+    asd_mask_dilate: int = 8
     bbox_shift: int = 0
     # Long video: auto-chunk when duration exceeds threshold (seconds).
     auto_chunk_threshold_sec: float = 120.0
@@ -68,6 +70,11 @@ class ServiceConfig:
     bbox_detect_stride: int = 3
     # Downscale for detection when short side exceeds this; <= threshold keeps original.
     detect_short_side: int = 720
+    # CodeFormer: restore only MuseTalk-generated speaking-face crops.
+    use_codeformer: bool = True
+    codeformer_model_path: str = "./models/codeformer/codeformer.pth"
+    # Higher = closer to input identity; lower = stronger restoration. Typical 0.5–0.8.
+    codeformer_fidelity: float = 0.7
     # Max simultaneous inference jobs (one engine instance per slot).
     max_concurrent_requests: int = 1
     # Optional per-slot GPU assignment, e.g. [0, 1]. Cycles when slots > len(gpu_ids).
@@ -130,6 +137,23 @@ class MuseTalkEngine:
                 device=self.device,
                 threshold=cfg.asd_threshold,
             )
+
+        self.codeformer = None
+        if cfg.use_codeformer:
+            try:
+                from musetalk.utils.codeformer_restorer import CodeFormerRestorer
+
+                self.codeformer = CodeFormerRestorer(
+                    model_path=cfg.codeformer_model_path,
+                    device=self.device,
+                    fidelity_weight=cfg.codeformer_fidelity,
+                )
+            except Exception as exc:
+                logger.warning(
+                    "CodeFormer disabled (failed to load): %s",
+                    exc,
+                )
+                self.codeformer = None
         logger.info("MuseTalk models loaded")
 
     @torch.no_grad()
@@ -363,11 +387,21 @@ class MuseTalkEngine:
                     fps=fps,
                 )
                 speaking_mask = speaking_mask[:video_num]
+                raw_speaking = sum(speaking_mask)
+                if cfg.asd_mask_dilate > 0:
+                    valid_face = [b != coord_placeholder for b in coord_list]
+                    speaking_mask = dilate_speaking_mask(
+                        speaking_mask,
+                        cfg.asd_mask_dilate,
+                        valid_face=valid_face,
+                    )
                 speaking_frames = sum(speaking_mask)
                 logger.info(
-                    "LR-ASD: %d/%d frames marked as speaking (threshold=%s)",
+                    "LR-ASD: %d/%d speaking after dilate±%d (raw=%d, threshold=%s)",
                     speaking_frames,
                     len(speaking_mask),
+                    cfg.asd_mask_dilate,
+                    raw_speaking,
                     cfg.asd_threshold,
                 )
             else:
@@ -468,9 +502,10 @@ class MuseTalkEngine:
                     else:
                         try:
                             ori_copy = copy.deepcopy(ori_frame)
-                            res_frame = cv2.resize(
-                                res_frame.astype(np.uint8), (x2 - x1, y2 - y1)
-                            )
+                            face = res_frame.astype(np.uint8)
+                            if self.codeformer is not None:
+                                face = self.codeformer.restore_face(face)
+                            res_frame = cv2.resize(face, (x2 - x1, y2 - y1))
                             if cfg.version == "v15":
                                 combine_frame = get_image(
                                     ori_copy,

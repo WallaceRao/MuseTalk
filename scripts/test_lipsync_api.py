@@ -76,7 +76,7 @@ if __name__ == "__main__":
         video,
         audio,
         output,
-        timeout=9600,
+        timeout=9600 + 3600,
     )
     elapsed = time.time() - started
 

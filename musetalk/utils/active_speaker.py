@@ -158,86 +158,134 @@ class LRASDDetector:
             mapped.append(float(scores_25fps[target_idx]))
         return mapped
 
+    def _score_av_clip(
+        self,
+        audio_feature: np.ndarray,
+        video_feature_25fps: np.ndarray,
+        audio_start: int,
+        audio_end: int,
+        video_start: int,
+        video_end: int,
+    ) -> List[float]:
+        """Score one AV clip; audio/video lengths must stay at 4 MFCC frames per video frame."""
+        if audio_end <= audio_start or video_end <= video_start:
+            return []
+        video_len = video_end - video_start
+        audio_len = audio_end - audio_start
+        # Keep LR-ASD's 100Hz MFCC : 25fps video = 4:1 alignment.
+        usable_video = min(video_len, audio_len // 4)
+        if usable_video <= 0:
+            return []
+        audio_end = audio_start + usable_video * 4
+        video_end = video_start + usable_video
+
+        input_a = torch.FloatTensor(
+            audio_feature[audio_start:audio_end, :]
+        ).unsqueeze(0).to(self.device)
+        input_v = torch.FloatTensor(
+            video_feature_25fps[video_start:video_end, :, :]
+        ).unsqueeze(0).to(self.device)
+
+        embed_a = self.model.forward_audio_frontend(input_a)
+        embed_v = self.model.forward_visual_frontend(input_v)
+        out = self.model.forward_audio_visual_backend(embed_a, embed_v)
+        return list(self.loss_av.forward(out, labels=None))
+
     def _score_sequence_25fps(
         self,
         audio_feature: np.ndarray,
         video_feature_25fps: np.ndarray,
     ) -> List[float]:
-        """Score AV sequence assuming video_feature is already at 25fps."""
+        """Score AV sequence assuming video_feature is already at 25fps.
+
+        Full windows are scored as usual. The remaining tail that is shorter than
+        one window is scored as its own clip so the end of the video is covered.
+        Multi-duration results are averaged with NaN-ignored means so incomplete
+        scales do not poison the tail with -inf.
+        """
         fps = LR_ASD_FPS
         audio_seconds = (audio_feature.shape[0] - audio_feature.shape[0] % 4) / MFCC_RATE
         video_seconds = video_feature_25fps.shape[0] / fps
         length = min(audio_seconds, video_seconds)
+        full_video_len = video_feature_25fps.shape[0]
         if length <= 0:
-            return [float("-inf")] * video_feature_25fps.shape[0]
+            return [float("-inf")] * full_video_len
 
         audio_len = int(round(length * MFCC_RATE))
         video_len = int(round(length * fps))
+        # Snap to 4:1 so clip scoring stays aligned.
+        video_len = min(video_len, audio_len // 4, full_video_len)
+        audio_len = video_len * 4
         audio_feature = audio_feature[:audio_len]
         video_feature_25fps = video_feature_25fps[:video_len]
 
         duration_set = [1, 1, 1, 2, 2, 2, 3, 3, 4, 5, 6]
-        all_scores = []
+        all_scores: List[List[float]] = []
 
         with torch.no_grad():
             for duration in duration_set:
+                scores: List[float] = []
                 batch_size = int(math.ceil(length / duration))
-                scores = []
                 for batch_idx in range(batch_size):
                     audio_start = int(batch_idx * duration * MFCC_RATE)
                     audio_end = int((batch_idx + 1) * duration * MFCC_RATE)
                     video_start = int(batch_idx * duration * fps)
                     video_end = int((batch_idx + 1) * duration * fps)
 
-                    if audio_end > audio_feature.shape[0] or video_end > video_feature_25fps.shape[0]:
-                        break
-
-                    # Guard against off-by-one rounding that breaks AV length match.
                     expected_video = int(duration * fps)
                     expected_audio = int(duration * MFCC_RATE)
-                    if (video_end - video_start) != expected_video:
-                        break
-                    if (audio_end - audio_start) != expected_audio:
-                        break
+                    full_window = (
+                        audio_end <= audio_len
+                        and video_end <= video_len
+                        and (video_end - video_start) == expected_video
+                        and (audio_end - audio_start) == expected_audio
+                    )
+                    if full_window:
+                        batch_scores = self._score_av_clip(
+                            audio_feature,
+                            video_feature_25fps,
+                            audio_start,
+                            audio_end,
+                            video_start,
+                            video_end,
+                        )
+                        scores.extend(batch_scores)
+                        continue
 
-                    input_a = torch.FloatTensor(
-                        audio_feature[audio_start:audio_end, :]
-                    ).unsqueeze(0).to(self.device)
-                    input_v = torch.FloatTensor(
-                        video_feature_25fps[video_start:video_end, :, :]
-                    ).unsqueeze(0).to(self.device)
-
-                    embed_a = self.model.forward_audio_frontend(input_a)
-                    embed_v = self.model.forward_visual_frontend(input_v)
-                    out = self.model.forward_audio_visual_backend(embed_a, embed_v)
-                    batch_scores = self.loss_av.forward(out, labels=None)
-                    scores.extend(batch_scores)
+                    # Last incomplete window: score only the remaining tail once.
+                    if video_start >= video_len or audio_start >= audio_len:
+                        break
+                    tail_scores = self._score_av_clip(
+                        audio_feature,
+                        video_feature_25fps,
+                        audio_start,
+                        audio_len,
+                        video_start,
+                        video_len,
+                    )
+                    scores.extend(tail_scores)
+                    break
 
                 if scores:
+                    # Pad missing frames as NaN so they are ignored in nanmean.
                     if len(scores) < video_len:
-                        scores.extend([float("-inf")] * (video_len - len(scores)))
+                        scores = scores + [float("nan")] * (video_len - len(scores))
                     else:
                         scores = scores[:video_len]
                     all_scores.append(scores)
 
         if not all_scores:
-            return [float("-inf")] * video_feature_25fps.shape[0]
+            return [float("-inf")] * full_video_len
 
-        max_len = max(len(scores) for scores in all_scores)
-        padded_scores = []
-        for scores in all_scores:
-            if len(scores) < max_len:
-                scores = scores + [float("-inf")] * (max_len - len(scores))
-            padded_scores.append(scores[:max_len])
+        score_arr = np.asarray(all_scores, dtype=np.float64)
+        with np.errstate(all="ignore"):
+            mean_scores = np.nanmean(score_arr, axis=0)
+        mean_scores = np.where(np.isfinite(mean_scores), np.round(mean_scores, 1), np.NINF)
+        mean_list = mean_scores.astype(float).tolist()
 
-        mean_scores = np.mean(np.array(padded_scores, dtype=np.float32), axis=0)
-        mean_scores = np.round(mean_scores, 1).astype(float).tolist()
-
-        if len(mean_scores) < video_feature_25fps.shape[0]:
-            mean_scores.extend(
-                [float("-inf")] * (video_feature_25fps.shape[0] - len(mean_scores))
-            )
-        return mean_scores[: video_feature_25fps.shape[0]]
+        if len(mean_list) < full_video_len:
+            mean_list.extend([float("-inf")] * (full_video_len - len(mean_list)))
+        return mean_list[:full_video_len]
 
     def compute_speaking_mask(
         self,
@@ -284,8 +332,36 @@ class LRASDDetector:
             window = raw_scores[
                 max(frame_idx - 2, 0) : min(frame_idx + 3, len(raw_scores))
             ]
-            score = float(np.mean(window)) if window else float("-inf")
+            finite = [s for s in window if np.isfinite(s)]
+            score = float(np.mean(finite)) if finite else float("-inf")
             smoothed_scores.append(score)
             speaking_mask.append(score >= self.threshold)
 
         return speaking_mask, smoothed_scores
+
+
+def dilate_speaking_mask(
+    speaking_mask: Sequence[bool],
+    radius: int,
+    *,
+    valid_face: Sequence[bool] | None = None,
+) -> List[bool]:
+    """Expand True regions by ``radius`` frames on both sides.
+
+    Frames without a valid face stay False when ``valid_face`` is provided.
+    """
+    n = len(speaking_mask)
+    if n == 0 or radius <= 0:
+        return list(speaking_mask)
+
+    dilated = [False] * n
+    for i, is_speaking in enumerate(speaking_mask):
+        if not is_speaking:
+            continue
+        lo = max(0, i - radius)
+        hi = min(n, i + radius + 1)
+        for j in range(lo, hi):
+            if valid_face is not None and not valid_face[j]:
+                continue
+            dilated[j] = True
+    return dilated

@@ -63,6 +63,95 @@ def decode_video_frames(video_path: str) -> tuple[list, float]:
     return frames, fps
 
 
+def decode_video_frame_range(
+    video_path: str,
+    start_frame: int,
+    frame_count: int,
+    *,
+    fps: float | None = None,
+) -> tuple[list, float]:
+    """Decode ``[start_frame, start_frame+frame_count)`` from the original file.
+
+    Uses ffmpeg ``trim`` + raw BGR pipe so chunking does **not** re-encode
+    (lossy x264 intermediates were wiping fragile mouth-open signals).
+    """
+    ensure_ffmpeg_env()
+    if frame_count <= 0:
+        raise ValueError("frame_count must be positive")
+    if start_frame < 0:
+        raise ValueError("start_frame must be >= 0")
+
+    if fps is None or fps <= 0:
+        info = probe_video_stream(video_path)
+        fps = float(info.fps)
+
+    # Probe size for raw frame packing.
+    cmd_probe = [
+        "ffprobe",
+        "-v",
+        "error",
+        "-select_streams",
+        "v:0",
+        "-show_entries",
+        "stream=width,height",
+        "-of",
+        "csv=p=0",
+        video_path,
+    ]
+    probe = subprocess.run(cmd_probe, capture_output=True, text=True, check=True)
+    w_str, h_str = probe.stdout.strip().split(",")[:2]
+    width, height = int(w_str), int(h_str)
+    frame_bytes = width * height * 3
+
+    end_frame = start_frame + frame_count
+    # Passthrough selected frames only — do NOT force -r/cfr (that resamples
+    # and can wipe the micro-open cues dual-crop rescue depends on).
+    vf = f"trim=start_frame={start_frame}:end_frame={end_frame},setpts=PTS-STARTPTS"
+    cmd = [
+        "ffmpeg",
+        "-v",
+        "error",
+        "-i",
+        video_path,
+        "-vf",
+        vf,
+        "-fps_mode",
+        "passthrough",
+        "-frames:v",
+        str(frame_count),
+        "-f",
+        "rawvideo",
+        "-pix_fmt",
+        "bgr24",
+        "pipe:1",
+    ]
+    proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+    assert proc.stdout is not None
+    frames: list[np.ndarray] = []
+    try:
+        for _ in range(frame_count):
+            buf = proc.stdout.read(frame_bytes)
+            if len(buf) != frame_bytes:
+                break
+            frame = np.frombuffer(buf, dtype=np.uint8).reshape((height, width, 3)).copy()
+            frames.append(frame)
+    finally:
+        proc.stdout.close()
+        stderr = proc.stderr.read() if proc.stderr is not None else b""
+        ret = proc.wait()
+    if ret != 0:
+        raise RuntimeError(
+            f"ffmpeg decode range failed ({start_frame}+{frame_count}): "
+            f"{stderr.decode('utf-8', errors='replace')}"
+        )
+    if len(frames) != frame_count:
+        raise RuntimeError(
+            f"Expected {frame_count} frames from {video_path} "
+            f"[{start_frame},{end_frame}), got {len(frames)}"
+        )
+    return frames, float(fps)
+
+
 def probe_duration(path: str) -> float:
     ensure_ffmpeg_env()
     cmd = [
@@ -328,7 +417,11 @@ def mux_video_with_source_audio(
     audio_source_path: str,
     output_path: str,
 ) -> None:
-    """Mux processed silent video with audio copied from the source video."""
+    """Mux processed silent video with the given audio (typically the driving input).
+
+    Audio is re-encoded to AAC so wav/mp3/etc. can be packed into mp4 reliably.
+    ``-shortest`` trims to the shorter of video/audio (aligned with lip-sync length).
+    """
     ensure_ffmpeg_env()
     os.makedirs(os.path.dirname(output_path) or ".", exist_ok=True)
     cmd = [
@@ -347,7 +440,9 @@ def mux_video_with_source_audio(
         "-c:v",
         "copy",
         "-c:a",
-        "copy",
+        "aac",
+        "-b:a",
+        "192k",
         "-shortest",
         output_path,
     ]

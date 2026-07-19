@@ -93,7 +93,75 @@ def get_image(image, face, face_box, upper_boundary_ratio=0.5, expand=1.5, mode=
     return body[:, :, ::-1]  # 返回处理后的图像（BGR 转 RGB）
 
 
-def get_image_blending(image, face, face_box, mask_array, crop_box):
+def match_face_color_lab(src_bgr: np.ndarray, ref_bgr: np.ndarray) -> np.ndarray:
+    """Reinhard-style color transfer in LAB so generated face matches original crop."""
+    if src_bgr is None or ref_bgr is None:
+        return src_bgr
+    if src_bgr.size == 0 or ref_bgr.size == 0:
+        return src_bgr
+    if src_bgr.shape[:2] != ref_bgr.shape[:2]:
+        ref_bgr = cv2.resize(ref_bgr, (src_bgr.shape[1], src_bgr.shape[0]), interpolation=cv2.INTER_LINEAR)
+
+    src = cv2.cvtColor(src_bgr, cv2.COLOR_BGR2LAB).astype(np.float32)
+    ref = cv2.cvtColor(ref_bgr, cv2.COLOR_BGR2LAB).astype(np.float32)
+    for c in range(3):
+        s = src[:, :, c]
+        r = ref[:, :, c]
+        s_std = float(s.std()) + 1e-6
+        r_std = float(r.std()) + 1e-6
+        src[:, :, c] = (s - float(s.mean())) * (r_std / s_std) + float(r.mean())
+    src = np.clip(src, 0, 255).astype(np.uint8)
+    return cv2.cvtColor(src, cv2.COLOR_LAB2BGR)
+
+
+def compute_segment_blend_alphas(active_mask, ramp_frames: int = 5) -> list:
+    """
+    Per-frame opacity for lipsync results inside contiguous True runs.
+
+    Near run start/end, alpha ramps 0→1 / 1→0 over ``ramp_frames`` so the
+    generated face can crossfade with the original frame.
+    """
+    n = len(active_mask)
+    alphas = [0.0] * n
+    ramp = max(0, int(ramp_frames))
+    i = 0
+    while i < n:
+        if not active_mask[i]:
+            i += 1
+            continue
+        j = i
+        while j < n and active_mask[j]:
+            j += 1
+        length = j - i
+        if ramp <= 0 or length <= 1:
+            for k in range(i, j):
+                alphas[k] = 1.0
+            i = j
+            continue
+        ramp_eff = min(ramp, max(1, length // 2))
+        for k in range(i, j):
+            dist_start = k - i
+            dist_end = j - 1 - k
+            a_in = 1.0 if dist_start >= ramp_eff else (dist_start + 1) / float(ramp_eff)
+            a_out = 1.0 if dist_end >= ramp_eff else (dist_end + 1) / float(ramp_eff)
+            alphas[k] = min(1.0, max(0.0, min(a_in, a_out)))
+        i = j
+    return alphas
+
+
+def blend_frames(original_bgr: np.ndarray, lipsync_bgr: np.ndarray, alpha: float) -> np.ndarray:
+    """Linear mix: alpha * lipsync + (1 - alpha) * original."""
+    if alpha >= 0.999:
+        return lipsync_bgr
+    if alpha <= 0.001:
+        return original_bgr
+    a = float(alpha)
+    out = (
+        lipsync_bgr.astype(np.float32) * a
+        + original_bgr.astype(np.float32) * (1.0 - a)
+    )
+    return np.clip(out, 0, 255).astype(np.uint8)
+
     body = Image.fromarray(image[:,:,::-1])
     face = Image.fromarray(face[:,:,::-1])
 

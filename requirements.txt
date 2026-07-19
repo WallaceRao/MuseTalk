@@ -21,6 +21,7 @@ moviepy
 python_speech_features
 fastapi
 uvicorn[standard]
+onnxruntime-gpu
 
 # CodeFormer face restoration (vendored under third_party/CodeFormer)
 lpips

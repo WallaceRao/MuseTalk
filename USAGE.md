@@ -131,6 +131,7 @@ uvicorn server:app --host 0.0.0.0 --port 8765
 | `MUSETALK_CODEFORMER_MODEL` | CodeFormer 权重路径 | `./models/codeformer/codeformer.pth` |
 | `MUSETALK_ASD_MASK_DILATE` | speaking mask 前后各膨胀帧数 | `8` |
 | `MUSETALK_ASD_THRESHOLD` | LR-ASD 分数阈值（logit，越低越宽松） | `0.0` |
+| `MUSETALK_CODEFORMER_STRIDE` | CodeFormer 每隔 N 个说话帧修复一次 | `2` |
 
 单卡建议保持 `MUSETALK_MAX_CONCURRENT=1`；短视频可尝试 `2`，长视频不建议。
 

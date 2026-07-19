@@ -69,17 +69,22 @@ def run_lipsync(
 if __name__ == "__main__":
     started = time.time()
     video = '/opt/oss/wujiedub/video_translate/20260610/10/1891/task/36454/36454_0_1891_watermarked.mp4'
-    audio = '/opt/oss/wujiedub/video_translate/20260610/10/1891/task/36454/translated_voice.wav'
+    video = '/opt/oss/wujiedub/video_translate/20260716/18/3497/task/77442/77442_0_3497_watermarked.mp4'
+    video = '/opt/oss/wujiedub/video_translate/20260716/19/3668/task/77445/77445_0_3668_watermarked.mp4'
+    video = '/opt/oss/wujiedub/video_translate/20260701/18/1088/input_videos/147f96fa7a.mp4'
+    
+    audio = '2min.wav'
+    audio = '/opt/oss/wujiedub/video_translate/20260717/14/1088/category_task/1284/79010/translated_voice.wav'
+    #audio = '/opt/oss/wujiedub/video_translate/20260716/18/3497/task/77442/translated_voice.wav'
     output = '/home/ubuntu/raoyonghui/MuseTalk/test_output.mp4'
     result = run_lipsync(
         base_url,
         video,
         audio,
         output,
-        timeout=9600 + 3600,
+        timeout=9600,
     )
     elapsed = time.time() - started
 
     print(f"\nCompleted in {elapsed:.1f}s")
     print(json.dumps(result, indent=2, ensure_ascii=False))
-

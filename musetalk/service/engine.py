@@ -5,7 +5,7 @@ import shutil
 import subprocess
 import tempfile
 from dataclasses import dataclass
-from typing import List, Optional
+from typing import List, Optional, Tuple
 
 import cv2
 import numpy as np
@@ -112,11 +112,11 @@ class ServiceConfig:
     asd_dilate_respect_shots: bool = True
     # After speaking detection: lipsync whole shots that contain speaking
     # long enough to pass ``lipsync_shot_min_speak_sec``.
-    lipsync_full_speaking_shots: bool = True
+    lipsync_full_speaking_shots: bool = False
     # Contiguous speaking (post-dilate) required inside a shot before expanding
     # lipsync to the whole shot. Filters brief VSDLM false positives
-    # (e.g. ~19/33/46/54/93s). ~1.1s keeps ~35s / ~106s, drops short FPs.
-    lipsync_shot_min_speak_sec: float = 1.1
+    # (e.g. ~19/33/46/54/93s). 1.5s is stricter than V1's 1.1s (drops ~20s FP expands).
+    lipsync_shot_min_speak_sec: float = 1.5
     # Shots shorter than this use ``lipsync_short_shot_min_speak_sec`` instead
     # (recovers brief real turns in ~1–2s cuts without relaxing long shots).
     lipsync_short_shot_sec: float = 2.0
@@ -155,6 +155,17 @@ class ServiceConfig:
     max_concurrent_requests: int = 1
     # Optional per-slot GPU assignment, e.g. [0, 1]. Cycles when slots > len(gpu_ids).
     gpu_ids: Optional[List[int]] = None
+    # Lip generation backend: "latentsync" (V2 default) or "musetalk" (V1).
+    lipsync_backend: str = "latentsync"
+    latentsync_repo: str = "./third_party/LatentSync"
+    latentsync_unet_config: str = "./third_party/LatentSync/configs/unet/stage2.yaml"
+    latentsync_ckpt: str = "./models/latentsync15/latentsync_unet.pt"
+    latentsync_whisper: str = "./models/latentsync15/whisper/tiny.pt"
+    latentsync_vae: str = "./models/sd-vae"
+    latentsync_inference_steps: int = 20
+    latentsync_guidance_scale: float = 1.5
+    latentsync_enable_deepcache: bool = True
+    latentsync_seed: int = 1247
 
 
 class MuseTalkEngine:
@@ -172,39 +183,75 @@ class MuseTalkEngine:
         except RuntimeError as exc:
             logger.warning("%s", exc)
 
+    @property
+    def _use_latentsync(self) -> bool:
+        return str(self.config.lipsync_backend).strip().lower() in {
+            "latentsync",
+            "latentsync15",
+            "ls",
+            "v2",
+        }
+
     def _load_models(self) -> None:
-        logger.info("Loading MuseTalk models on %s", self.device)
         cfg = self.config
-        self.vae, self.unet, self.pe = load_all_model(
-            unet_model_path=cfg.unet_model_path,
-            vae_type=cfg.vae_type,
-            unet_config=cfg.unet_config,
-            device=self.device,
-        )
+        self.latentsync = None
+        self.vae = None
+        self.unet = None
+        self.pe = None
+        self.whisper = None
+        self.audio_processor = None
+        self.fp = None
+        self.weight_dtype = torch.float16 if cfg.use_float16 else torch.float32
         self.timesteps = torch.tensor([0], device=self.device)
 
-        if cfg.use_float16:
-            self.pe = self.pe.half()
-            self.vae.vae = self.vae.vae.half()
-            self.unet.model = self.unet.model.half()
+        if self._use_latentsync:
+            from musetalk.service.latentsync_backend import LatentSyncBackend
 
-        self.pe = self.pe.to(self.device)
-        self.vae.vae = self.vae.vae.to(self.device)
-        self.unet.model = self.unet.model.to(self.device)
-
-        self.audio_processor = AudioProcessor(feature_extractor_path=cfg.whisper_dir)
-        self.weight_dtype = self.unet.model.dtype
-        self.whisper = WhisperModel.from_pretrained(cfg.whisper_dir)
-        self.whisper = self.whisper.to(device=self.device, dtype=self.weight_dtype).eval()
-        self.whisper.requires_grad_(False)
-
-        if cfg.version == "v15":
-            self.fp = FaceParsing(
-                left_cheek_width=cfg.left_cheek_width,
-                right_cheek_width=cfg.right_cheek_width,
+            logger.info("Loading LatentSync 1.5 lipsync backend on %s", self.device)
+            self.latentsync = LatentSyncBackend(
+                device=self.device,
+                repo_root=cfg.latentsync_repo,
+                unet_config=cfg.latentsync_unet_config,
+                checkpoint=cfg.latentsync_ckpt,
+                whisper_tiny=cfg.latentsync_whisper,
+                vae_path=cfg.latentsync_vae,
+                inference_steps=cfg.latentsync_inference_steps,
+                guidance_scale=cfg.latentsync_guidance_scale,
+                enable_deepcache=cfg.latentsync_enable_deepcache,
+                seed=cfg.latentsync_seed,
+                use_float16=cfg.use_float16,
             )
         else:
-            self.fp = FaceParsing()
+            logger.info("Loading MuseTalk models on %s", self.device)
+            self.vae, self.unet, self.pe = load_all_model(
+                unet_model_path=cfg.unet_model_path,
+                vae_type=cfg.vae_type,
+                unet_config=cfg.unet_config,
+                device=self.device,
+            )
+
+            if cfg.use_float16:
+                self.pe = self.pe.half()
+                self.vae.vae = self.vae.vae.half()
+                self.unet.model = self.unet.model.half()
+
+            self.pe = self.pe.to(self.device)
+            self.vae.vae = self.vae.vae.to(self.device)
+            self.unet.model = self.unet.model.to(self.device)
+
+            self.audio_processor = AudioProcessor(feature_extractor_path=cfg.whisper_dir)
+            self.weight_dtype = self.unet.model.dtype
+            self.whisper = WhisperModel.from_pretrained(cfg.whisper_dir)
+            self.whisper = self.whisper.to(device=self.device, dtype=self.weight_dtype).eval()
+            self.whisper.requires_grad_(False)
+
+            if cfg.version == "v15":
+                self.fp = FaceParsing(
+                    left_cheek_width=cfg.left_cheek_width,
+                    right_cheek_width=cfg.right_cheek_width,
+                )
+            else:
+                self.fp = FaceParsing()
 
         self.vsdlm_detector = None
         self.asd_detector = None
@@ -241,7 +288,8 @@ class MuseTalkEngine:
             )
 
         self.codeformer = None
-        if cfg.use_codeformer:
+        # CodeFormer restores MuseTalk face crops; skip for LatentSync full-frame output.
+        if cfg.use_codeformer and not self._use_latentsync:
             try:
                 from musetalk.utils.codeformer_restorer import CodeFormerRestorer
 
@@ -258,7 +306,10 @@ class MuseTalkEngine:
                     exc,
                 )
                 self.codeformer = None
-        logger.info("MuseTalk models loaded")
+        logger.info(
+            "Lip-sync engine ready (backend=%s)",
+            "latentsync" if self._use_latentsync else "musetalk",
+        )
 
     @torch.no_grad()
     def run_lipsync(
@@ -269,6 +320,7 @@ class MuseTalkEngine:
         *,
         force_chunk: bool = False,
         chunk_duration_sec: Optional[float] = None,
+        vad_segments: Optional[List[Tuple[float, float]]] = None,
     ) -> dict:
         video_path = os.path.abspath(video_path)
         audio_path = os.path.abspath(audio_path)
@@ -304,6 +356,7 @@ class MuseTalkEngine:
                     audio_path=audio_path,
                     output_path=output_path,
                     chunk_duration_sec=chunk_sec,
+                    vad_segments=vad_segments,
                 )
 
         return self._run_lipsync_single(
@@ -311,6 +364,7 @@ class MuseTalkEngine:
             audio_path,
             output_path,
             audio_mux_source=audio_path,
+            vad_segments=vad_segments,
         )
 
     @torch.no_grad()
@@ -320,7 +374,11 @@ class MuseTalkEngine:
         audio_path: str,
         output_path: str,
         chunk_duration_sec: float,
+        *,
+        vad_segments: Optional[List[Tuple[float, float]]] = None,
     ) -> dict:
+        from musetalk.utils.vad_client import clip_vad_segments_to_window
+
         effective_frames, fps = compute_effective_frame_count(video_path, audio_path)
         segments = compute_segments(effective_frames, fps, chunk_duration_sec)
         expected_total_frames = sum(segment.frame_count for segment in segments)
@@ -372,6 +430,16 @@ class MuseTalkEngine:
                     chunk_audio,
                 )
 
+                chunk_vad = None
+                if vad_segments is not None:
+                    chunk_t0 = float(segment.start_frame) / float(fps)
+                    chunk_dur = float(segment.frame_count) / float(fps)
+                    chunk_vad = clip_vad_segments_to_window(
+                        vad_segments,
+                        window_start_sec=chunk_t0,
+                        window_duration_sec=chunk_dur,
+                    )
+
                 result = self._run_lipsync_single(
                     video_path,
                     chunk_audio,
@@ -379,6 +447,7 @@ class MuseTalkEngine:
                     audio_mux_source=None,
                     preloaded_frames=chunk_frames,
                     preloaded_fps=chunk_fps,
+                    vad_segments=chunk_vad,
                 )
                 validate_frame_count(
                     chunk_output,
@@ -421,6 +490,7 @@ class MuseTalkEngine:
         audio_mux_source: Optional[str] = None,
         preloaded_frames: Optional[List[np.ndarray]] = None,
         preloaded_fps: Optional[float] = None,
+        vad_segments: Optional[List[Tuple[float, float]]] = None,
     ) -> dict:
         video_path = os.path.abspath(video_path)
         audio_path = os.path.abspath(audio_path)
@@ -474,17 +544,21 @@ class MuseTalkEngine:
                 else:
                     raise ValueError(f"Unsupported video input: {video_path}")
 
-            whisper_input_features, librosa_length = self.audio_processor.get_audio_feature(audio_path)
-            whisper_chunks = self.audio_processor.get_whisper_chunk(
-                whisper_input_features,
-                self.device,
-                self.weight_dtype,
-                self.whisper,
-                librosa_length,
-                fps=fps,
-                audio_padding_length_left=cfg.audio_padding_length_left,
-                audio_padding_length_right=cfg.audio_padding_length_right,
-            )
+            whisper_chunks = None
+            if not self._use_latentsync:
+                whisper_input_features, librosa_length = self.audio_processor.get_audio_feature(
+                    audio_path
+                )
+                whisper_chunks = self.audio_processor.get_whisper_chunk(
+                    whisper_input_features,
+                    self.device,
+                    self.weight_dtype,
+                    self.whisper,
+                    librosa_length,
+                    fps=fps,
+                    audio_padding_length_left=cfg.audio_padding_length_left,
+                    audio_padding_length_right=cfg.audio_padding_length_right,
+                )
 
             logger.info(
                 "Extracting landmarks for %d frames (detect_stride=%d, detect_short_side=%d, min_face_area_ratio=%.4f)",
@@ -502,8 +576,11 @@ class MuseTalkEngine:
                 return_mouth_coords=True,
             )
 
-            video_num = min(len(whisper_chunks), len(frame_list))
-            whisper_chunks = whisper_chunks[:video_num]
+            if whisper_chunks is not None:
+                video_num = min(len(whisper_chunks), len(frame_list))
+                whisper_chunks = whisper_chunks[:video_num]
+            else:
+                video_num = len(frame_list)
             coord_list = coord_list[:video_num]
             frame_list = frame_list[:video_num]
             mouth_coord_list = mouth_coord_list[:video_num]
@@ -515,8 +592,9 @@ class MuseTalkEngine:
             if cfg.use_vsdlm and self.vsdlm_detector is not None:
                 if cfg.use_vad_fusion:
                     logger.info(
-                        "Running VAD×VSDLM fusion (vad=%s)",
-                        cfg.vad_url,
+                        "Running VAD×VSDLM fusion (vad=%s%s)",
+                        "client-provided" if vad_segments is not None else cfg.vad_url,
+                        f", {len(vad_segments)} segs" if vad_segments is not None else "",
                     )
                     speaking_mask, fusion_meta = build_fused_speaking_mask(
                         self.vsdlm_detector,
@@ -525,6 +603,7 @@ class MuseTalkEngine:
                         audio_path,
                         fps=fps,
                         vad_url=cfg.vad_url,
+                        vad_segments=vad_segments,
                         detect_short_side=cfg.detect_short_side,
                         min_face_area_ratio=cfg.min_face_area_ratio,
                         detect_stride=cfg.asd_face_detect_stride,
@@ -818,7 +897,18 @@ class MuseTalkEngine:
                 raise ValueError("No valid face detected in the input video")
 
             res_by_index: dict[int, np.ndarray] = {}
-            if infer_indices:
+            full_frame_by_index: dict[int, np.ndarray] = {}
+            if infer_indices and self._use_latentsync:
+                if self.latentsync is None:
+                    raise RuntimeError("LatentSync backend is not loaded")
+                full_frame_by_index = self.latentsync.lipsync_indices(
+                    frame_list=frame_list,
+                    audio_path=audio_path,
+                    infer_indices=infer_indices,
+                    fps=float(fps),
+                    temp_dir=os.path.join(temp_dir, "latentsync"),
+                )
+            elif infer_indices:
                 logger.info(
                     "Encoding latents for %d speaking frames (skipped %d)",
                     len(infer_indices),
@@ -873,139 +963,182 @@ class MuseTalkEngine:
             height, width = frame_list[0].shape[:2]
             temp_vid_path = os.path.join(temp_dir, f"temp_{output_basename}.mp4")
 
-            # Batch CodeFormer restore before the per-frame blend loop.
-            # Stride reuse must stay on the same face track: if bbox IoU drops or
-            # speaking frames are far apart, force a fresh restore (never paste the
-            # previous person's restored face onto a new bbox).
-            restored_by_index: dict[int, np.ndarray] = {}
-            if res_by_index and self.codeformer is not None:
-                infer_keys = sorted(res_by_index.keys())
-                stride = max(1, int(cfg.codeformer_stride))
-                cf_reuse_min_iou = 0.35
-                cf_max_frame_gap = max(stride * 3, 6)
-
-                restore_keys: list[int] = []
-                last_key = None
-                for j, idx in enumerate(infer_keys):
-                    need = (j % stride == 0) or (j == len(infer_keys) - 1)
-                    if last_key is not None and not need:
-                        gap = idx - last_key
-                        iou = _bbox_iou(coord_list[last_key], coord_list[idx])
-                        if gap > cf_max_frame_gap or iou < cf_reuse_min_iou:
-                            need = True
-                    if need:
-                        restore_keys.append(idx)
-                        last_key = idx
-
-                face_batch = [res_by_index[i].astype(np.uint8) for i in restore_keys]
-                logger.info(
-                    "CodeFormer restoring %d/%d faces (fp16=%s, batch_size=%d, stride=%d)",
-                    len(face_batch),
-                    len(infer_keys),
-                    self.codeformer.use_fp16,
-                    self.codeformer.batch_size,
-                    stride,
-                )
-                restored_faces = self.codeformer.restore_faces(face_batch)
-                restored_map = dict(zip(restore_keys, restored_faces))
-                last_face = None
-                last_key = None
-                for idx in infer_keys:
-                    if idx in restored_map:
-                        last_face = restored_map[idx]
-                        last_key = idx
-                        restored_by_index[idx] = last_face
-                        continue
-                    can_reuse = (
-                        last_face is not None
-                        and last_key is not None
-                        and (idx - last_key) <= cf_max_frame_gap
-                        and _bbox_iou(coord_list[last_key], coord_list[idx])
-                        >= cf_reuse_min_iou
-                    )
-                    if can_reuse:
-                        restored_by_index[idx] = last_face
-                    else:
-                        # Identity/track changed: keep this frame's MuseTalk face.
-                        restored_by_index[idx] = res_by_index[idx].astype(np.uint8)
-                        last_face = None
-                        last_key = None
-            else:
-                restored_by_index = {
-                    i: frame.astype(np.uint8) for i, frame in res_by_index.items()
-                }
-
-            with FFmpegRawVideoWriter(
-                temp_vid_path,
-                width=width,
-                height=height,
-                fps=float(fps),
-                crf=18,
-                preset="veryfast",
-            ) as writer:
-                active_mask = [i in restored_by_index for i in range(video_num)]
+            # LatentSync already pastes lips onto full frames; composite is a
+            # full-frame replace with optional edge blend. MuseTalk keeps the
+            # face-crop + CodeFormer + parsing blend path.
+            if self._use_latentsync:
+                active_mask = [i in full_frame_by_index for i in range(video_num)]
                 blend_alphas = compute_segment_blend_alphas(
                     active_mask, ramp_frames=cfg.blend_ramp_frames
                 )
-                if cfg.blend_ramp_frames > 0 or cfg.use_color_match:
+                if cfg.blend_ramp_frames > 0:
                     logger.info(
-                        "Composite smoothing: color_match=%s, blend_ramp_frames=%d",
-                        cfg.use_color_match,
+                        "LatentSync composite: blend_ramp_frames=%d, synced=%d/%d",
                         cfg.blend_ramp_frames,
+                        len(full_frame_by_index),
+                        video_num,
                     )
-
-                for i in tqdm(range(video_num)):
-                    bbox = coord_list[i]
-                    ori_frame = frame_list[i]
-                    face = restored_by_index.get(i)
-                    # No face / invalid box: keep original frame (avoid ghost paste).
-                    if (
-                        face is None
-                        or bbox == coord_placeholder
-                        or bbox[2] <= bbox[0]
-                        or bbox[3] <= bbox[1]
-                    ):
-                        writer.write(ori_frame)
-                        continue
-
-                    x1, y1, x2, y2 = int(bbox[0]), int(bbox[1]), int(bbox[2]), int(bbox[3])
-                    if cfg.version == "v15":
-                        y2 = min(y2 + cfg.extra_margin, ori_frame.shape[0])
-                    if x2 <= x1 or y2 <= y1:
-                        writer.write(ori_frame)
-                        continue
-
-                    alpha = blend_alphas[i] if i < len(blend_alphas) else 1.0
-                    if alpha <= 0.001:
-                        writer.write(ori_frame)
-                        continue
-
-                    try:
-                        ori_copy = ori_frame.copy()
-                        res_frame = cv2.resize(face, (x2 - x1, y2 - y1))
-                        if cfg.use_color_match:
-                            ori_crop = ori_frame[y1:y2, x1:x2]
-                            if ori_crop.size > 0:
-                                res_frame = match_face_color_lab(res_frame, ori_crop)
-                        if cfg.version == "v15":
-                            combine_frame = get_image(
-                                ori_copy,
-                                res_frame,
-                                [x1, y1, x2, y2],
-                                mode=cfg.parsing_mode,
-                                fp=self.fp,
-                            )
-                        else:
-                            combine_frame = get_image(
-                                ori_copy, res_frame, [x1, y1, x2, y2], fp=self.fp
+                with FFmpegRawVideoWriter(
+                    temp_vid_path,
+                    width=width,
+                    height=height,
+                    fps=float(fps),
+                    crf=18,
+                    preset="veryfast",
+                ) as writer:
+                    for i in tqdm(range(video_num)):
+                        ori_frame = frame_list[i]
+                        synced = full_frame_by_index.get(i)
+                        if synced is None:
+                            writer.write(ori_frame)
+                            continue
+                        alpha = blend_alphas[i] if i < len(blend_alphas) else 1.0
+                        if alpha <= 0.001:
+                            writer.write(ori_frame)
+                            continue
+                        combine_frame = synced
+                        if combine_frame.shape[0] != height or combine_frame.shape[1] != width:
+                            combine_frame = cv2.resize(
+                                combine_frame, (width, height), interpolation=cv2.INTER_LANCZOS4
                             )
                         if alpha < 0.999:
                             combine_frame = blend_frames(ori_frame, combine_frame, alpha)
                         lipsync_frames += 1
-                    except Exception:
-                        combine_frame = ori_frame
+                        writer.write(combine_frame)
+            else:
+                # Batch CodeFormer restore before the per-frame blend loop.
+                # Stride reuse must stay on the same face track: if bbox IoU drops or
+                # speaking frames are far apart, force a fresh restore (never paste the
+                # previous person's restored face onto a new bbox).
+                restored_by_index: dict[int, np.ndarray] = {}
+                if res_by_index and self.codeformer is not None:
+                    infer_keys = sorted(res_by_index.keys())
+                    stride = max(1, int(cfg.codeformer_stride))
+                    cf_reuse_min_iou = 0.35
+                    cf_max_frame_gap = max(stride * 3, 6)
 
-                    writer.write(combine_frame)
+                    restore_keys: list[int] = []
+                    last_key = None
+                    for j, idx in enumerate(infer_keys):
+                        need = (j % stride == 0) or (j == len(infer_keys) - 1)
+                        if last_key is not None and not need:
+                            gap = idx - last_key
+                            iou = _bbox_iou(coord_list[last_key], coord_list[idx])
+                            if gap > cf_max_frame_gap or iou < cf_reuse_min_iou:
+                                need = True
+                        if need:
+                            restore_keys.append(idx)
+                            last_key = idx
+
+                    face_batch = [res_by_index[i].astype(np.uint8) for i in restore_keys]
+                    logger.info(
+                        "CodeFormer restoring %d/%d faces (fp16=%s, batch_size=%d, stride=%d)",
+                        len(face_batch),
+                        len(infer_keys),
+                        self.codeformer.use_fp16,
+                        self.codeformer.batch_size,
+                        stride,
+                    )
+                    restored_faces = self.codeformer.restore_faces(face_batch)
+                    restored_map = dict(zip(restore_keys, restored_faces))
+                    last_face = None
+                    last_key = None
+                    for idx in infer_keys:
+                        if idx in restored_map:
+                            last_face = restored_map[idx]
+                            last_key = idx
+                            restored_by_index[idx] = last_face
+                            continue
+                        can_reuse = (
+                            last_face is not None
+                            and last_key is not None
+                            and (idx - last_key) <= cf_max_frame_gap
+                            and _bbox_iou(coord_list[last_key], coord_list[idx])
+                            >= cf_reuse_min_iou
+                        )
+                        if can_reuse:
+                            restored_by_index[idx] = last_face
+                        else:
+                            # Identity/track changed: keep this frame's MuseTalk face.
+                            restored_by_index[idx] = res_by_index[idx].astype(np.uint8)
+                            last_face = None
+                            last_key = None
+                else:
+                    restored_by_index = {
+                        i: frame.astype(np.uint8) for i, frame in res_by_index.items()
+                    }
+
+                with FFmpegRawVideoWriter(
+                    temp_vid_path,
+                    width=width,
+                    height=height,
+                    fps=float(fps),
+                    crf=18,
+                    preset="veryfast",
+                ) as writer:
+                    active_mask = [i in restored_by_index for i in range(video_num)]
+                    blend_alphas = compute_segment_blend_alphas(
+                        active_mask, ramp_frames=cfg.blend_ramp_frames
+                    )
+                    if cfg.blend_ramp_frames > 0 or cfg.use_color_match:
+                        logger.info(
+                            "Composite smoothing: color_match=%s, blend_ramp_frames=%d",
+                            cfg.use_color_match,
+                            cfg.blend_ramp_frames,
+                        )
+
+                    for i in tqdm(range(video_num)):
+                        bbox = coord_list[i]
+                        ori_frame = frame_list[i]
+                        face = restored_by_index.get(i)
+                        # No face / invalid box: keep original frame (avoid ghost paste).
+                        if (
+                            face is None
+                            or bbox == coord_placeholder
+                            or bbox[2] <= bbox[0]
+                            or bbox[3] <= bbox[1]
+                        ):
+                            writer.write(ori_frame)
+                            continue
+
+                        x1, y1, x2, y2 = int(bbox[0]), int(bbox[1]), int(bbox[2]), int(bbox[3])
+                        if cfg.version == "v15":
+                            y2 = min(y2 + cfg.extra_margin, ori_frame.shape[0])
+                        if x2 <= x1 or y2 <= y1:
+                            writer.write(ori_frame)
+                            continue
+
+                        alpha = blend_alphas[i] if i < len(blend_alphas) else 1.0
+                        if alpha <= 0.001:
+                            writer.write(ori_frame)
+                            continue
+
+                        try:
+                            ori_copy = ori_frame.copy()
+                            res_frame = cv2.resize(face, (x2 - x1, y2 - y1))
+                            if cfg.use_color_match:
+                                ori_crop = ori_frame[y1:y2, x1:x2]
+                                if ori_crop.size > 0:
+                                    res_frame = match_face_color_lab(res_frame, ori_crop)
+                            if cfg.version == "v15":
+                                combine_frame = get_image(
+                                    ori_copy,
+                                    res_frame,
+                                    [x1, y1, x2, y2],
+                                    mode=cfg.parsing_mode,
+                                    fp=self.fp,
+                                )
+                            else:
+                                combine_frame = get_image(
+                                    ori_copy, res_frame, [x1, y1, x2, y2], fp=self.fp
+                                )
+                            if alpha < 0.999:
+                                combine_frame = blend_frames(ori_frame, combine_frame, alpha)
+                            lipsync_frames += 1
+                        except Exception:
+                            combine_frame = ori_frame
+
+                        writer.write(combine_frame)
 
             if audio_mux_source and has_audio_stream(audio_mux_source):
                 logger.info("Muxing input audio into final output: %s", audio_mux_source)

@@ -1,5 +1,7 @@
 # MuseTalk 口型同步服务 — 使用说明
 
+**当前版本：V2**（对口型后端 = LatentSync 1.5；说话门控与 V1 相同，见 [`docs/V2.md`](docs/V2.md) / [`docs/V1.md`](docs/V1.md)）
+
 项目路径：`/home/ubuntu/raoyonghui/MuseTalk`  
 当前机器：NVIDIA L20（约 46GB 显存）
 
@@ -29,16 +31,20 @@ cd /home/ubuntu/raoyonghui/MuseTalk
 
 | 用途 | 路径 |
 |------|------|
-| MuseTalk v1.5 UNet | `models/musetalkV15/unet.pth` |
+| **LatentSync 1.5 UNet（V2 默认）** | `models/latentsync15/latentsync_unet.pt` |
+| LatentSync Whisper tiny | `models/latentsync15/whisper/tiny.pt` |
+| LatentSync 源码 | `third_party/LatentSync` |
+| MuseTalk v1.5 UNet（`MUSETALK_LIPSYNC_BACKEND=musetalk`） | `models/musetalkV15/unet.pth` |
 | MuseTalk v1.5 配置 | `models/musetalkV15/musetalk.json` |
 | MuseTalk v1.0（备用） | `models/musetalk/` |
 | VAE | `models/sd-vae/` |
-| Whisper | `models/whisper/` |
+| Whisper（MuseTalk） | `models/whisper/` |
 | DWPose 人脸/姿态 | `models/dwpose/dw-ll_ucoco_384.pth` |
 | Face Parsing | `models/face-parse-bisent/` |
 | SyncNet | `models/syncnet/latentsync_syncnet.pt` |
-| LR-ASD 说话人检测 | `third_party/LR-ASD/weight/finetuning_TalkSet.model` |
-| CodeFormer 人脸修复 | `models/codeformer/codeformer.pth` |
+| VSDLM 张嘴检测（门控，V1/V2 共用） | `third_party/VSDLM/vsdlm_m.onnx` |
+| LR-ASD（可选备用，默认关） | `third_party/LR-ASD/weight/finetuning_TalkSet.model` |
+| CodeFormer 人脸修复（MuseTalk 后端） | `models/codeformer/codeformer.pth` |
 
 若缺少 CodeFormer 权重，可从官方 Release 下载（约 360MB）：
 
@@ -120,22 +126,28 @@ export PATH=/usr/local/ffmpeg/bin:$PATH
 uvicorn server:app --host 0.0.0.0 --port 8765
 ```
 
-可选环境变量：
+可选环境变量（口型门控完整表见 [`docs/V1.md`](docs/V1.md) §5；V2 后端见 [`docs/V2.md`](docs/V2.md)）：
 
 | 变量 | 含义 | 默认 |
 |------|------|------|
+| `MUSETALK_LIPSYNC_BACKEND` | 对口型后端：`latentsync` / `musetalk` | `latentsync` |
+| `MUSETALK_LATENTSYNC_STEPS` | LatentSync 扩散步数 | `20` |
+| `MUSETALK_LATENTSYNC_GUIDANCE` | LatentSync CFG | `1.5` |
 | `MUSETALK_MAX_CONCURRENT` | 最大并发推理数 | `1` |
 | `MUSETALK_GPU_IDS` | 各引擎槽位 GPU，如 `0,1` | 未设置则用 `gpu_id=0` |
-| `MUSETALK_USE_CODEFORMER` | 是否对人脸生成结果做 CodeFormer 修复 | `true` |
+| `MUSETALK_USE_CODEFORMER` | 是否对人脸生成结果做 CodeFormer 修复（仅 MuseTalk 后端） | `true` |
 | `MUSETALK_CODEFORMER_FIDELITY` | 保真度 `0~1`（越高越接近原脸） | `0.7` |
 | `MUSETALK_CODEFORMER_MODEL` | CodeFormer 权重路径 | `./models/codeformer/codeformer.pth` |
 | `MUSETALK_ASD_MASK_DILATE` | speaking mask 前后各膨胀帧数 | `8` |
-| `MUSETALK_ASD_THRESHOLD` | LR-ASD 分数阈值（logit，越低越宽松） | `0.0` |
+| `MUSETALK_VAD_URL` | TenVAD 服务地址 | `http://127.0.0.1:8061/vad_detect/` |
+| `MUSETALK_LIPSYNC_SHOT_MIN_SPEAK_SEC` | 长镜头整镜扩门槛（秒） | `1.5` |
+| `MUSETALK_LIPSYNC_KEEP_PARTIAL_MIN_SEC` | 非整镜时保留片段最短秒 | `0.5` |
+| `MUSETALK_VSDLM_SOFT_CLOSED_MAR` | MAR≈0 时压低 open | `0.06` |
 | `MUSETALK_CODEFORMER_STRIDE` | CodeFormer 每隔 N 个说话帧修复一次 | `2` |
 
 单卡建议保持 `MUSETALK_MAX_CONCURRENT=1`；短视频可尝试 `2`，长视频不建议。
 
-CodeFormer 仅作用于 **LR-ASD 判定为说话、且已生成口型的人脸 crop**；失败时自动回退到未修复人脸。权重缺失时服务仍可启动，但会跳过修复。
+CodeFormer 仅作用于 **MuseTalk 后端**下门控为说话的人脸 crop；LatentSync 后端为整帧输出，默认不跑 CodeFormer。
 
 ---
 
@@ -180,7 +192,7 @@ Content-Type: application/json
 - **画面**：按 `audio_path` 做口型同步  
 - **声音**：保留**原视频音轨**（不替换成 `audio_path`）  
 - **长视频**：有效时长 > 120s 时自动按帧精确分段（默认每段 60s），再校验帧数并拼接  
-- **说话人检测**：默认开启 LR-ASD，仅对判定为说话的人脸做口型同步  
+- **说话门控（V1）**：默认 **VAD × VSDLM**；仅对判定为说话的人脸帧做口型同步（整镜或 ≥0.5s 片段）。规则详见 [`docs/V1.md`](docs/V1.md) §3  
 
 示例：
 
@@ -282,7 +294,9 @@ MuseTalk/
 │   ├── long_video.py         # 长视频帧精确分段/拼接
 │   └── logging_setup.py
 ├── models/                   # 模型权重
-├── third_party/LR-ASD/       # 说话人检测
+├── third_party/VSDLM/        # V1 张嘴检测 ONNX
+├── third_party/LR-ASD/       # 可选备用 ASD
+├── docs/V1.md                # V1 说明与口型判定规则
 ├── configs/inference/        # CLI 配置
 └── logs/                     # 服务日志
 ```

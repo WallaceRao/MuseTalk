@@ -13,6 +13,9 @@ Environment=PATH=/home/ubuntu/miniconda3/envs/heng/bin:/usr/local/ffmpeg/bin:/us
 Environment=LD_LIBRARY_PATH=/usr/local/ffmpeg/lib
 Environment=PYTHONUNBUFFERED=1
 Environment=CUDA_VISIBLE_DEVICES=0
+# V2 default: LatentSync 1.5 lipsync; set musetalk to roll back to V1 generator
+Environment=MUSETALK_LIPSYNC_BACKEND=latentsync
+Environment=HF_ENDPOINT=https://hf-mirror.com
 
 ExecStart=/home/ubuntu/miniconda3/envs/heng/bin/uvicorn server:app --host 0.0.0.0 --port 8765
 ExecStop=/bin/kill -SIGTERM $MAINPID

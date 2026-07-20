@@ -8,7 +8,8 @@ Pipeline
 4. Assign each VAD segment to the nearest VSDLM speaker in time.
 5. If one VAD segment overlaps multiple VSDLM speakers, split it at speaker
    switch points inside the segment.
-6. Build a lipsync speaking mask for the MuseTalk primary face track.
+6. Per frame, pick the face with strongest recent lip-open as active speaker
+   and gate lipsync as VAD ∩ that face's loose VSDLM lip motion.
 """
 
 from __future__ import annotations
@@ -194,6 +195,7 @@ def compute_visual_speaking_intervals(
     shot_ids: Sequence[int] | None = None,
     skip_track_ids: Sequence[int] | None = None,
     only_multiface_frames: bool = False,
+    min_speak_duration_sec: float | None = None,
 ) -> List[VisualInterval]:
     """Run batched VSDLM per tracked face and return speaking intervals.
 
@@ -204,35 +206,62 @@ def compute_visual_speaking_intervals(
     When ``only_multiface_frames`` is True, faces are scored only on frames that
     contain 2+ tracks (enough for other-speaker exclusion). ``skip_track_ids``
     omits already-scored primary faces.
+
+    ``min_speak_duration_sec`` overrides the detector default when set (e.g. loose
+    gate uses 0.2s while strict turns keep 0.5s).
     """
+    open_probs, coord_streams = score_track_open_probs(
+        vsdlm_detector,
+        frame_list,
+        frame_tracks,
+        shot_ids=shot_ids,
+        skip_track_ids=skip_track_ids,
+        only_multiface_frames=only_multiface_frames,
+    )
+    return intervals_from_track_open_probs(
+        vsdlm_detector,
+        open_probs,
+        coord_streams,
+        fps=fps,
+        shot_ids=shot_ids,
+        min_speak_duration_sec=min_speak_duration_sec,
+    )
+
+
+def score_track_open_probs(
+    vsdlm_detector,
+    frame_list: Sequence[np.ndarray],
+    frame_tracks: Sequence[Dict[int, BBox]],
+    *,
+    shot_ids: Sequence[int] | None = None,
+    skip_track_ids: Sequence[int] | None = None,
+    only_multiface_frames: bool = False,
+) -> Tuple[Dict[int, List[float]], Dict[int, List[BBox]]]:
+    """Batch-score VSDLM open probs for every tracked face."""
     n = len(frame_list)
-    fps = float(fps) if fps and fps > 0 else 25.0
     if shot_ids is not None and len(shot_ids) != n:
         raise ValueError("shot_ids length must match frame_list")
     skip = {int(x) for x in (skip_track_ids or ())}
     track_ids = sorted(
         {tid for ft in frame_tracks for tid in ft if int(tid) not in skip}
     )
-    if not track_ids:
-        return []
-
     open_probs: Dict[int, List[float]] = {
         tid: [float("nan")] * n for tid in track_ids
     }
     coord_streams: Dict[int, List[BBox]] = {
         tid: [coord_placeholder] * n for tid in track_ids
     }
+    if not track_ids:
+        return open_probs, coord_streams
+
     crop_keys: List[Tuple[int, int]] = []
     crops: List[np.ndarray] = []
-
     for fi, frame in enumerate(frame_list):
         tracks = frame_tracks[fi]
         if only_multiface_frames and len(tracks) < 2:
             continue
         for tid, bbox in tracks.items():
-            if int(tid) in skip:
-                continue
-            if tid not in coord_streams:
+            if int(tid) in skip or tid not in coord_streams:
                 continue
             coord_streams[tid][fi] = bbox
             crop = vsdlm_detector._mouth_crop_from_face(frame, bbox)
@@ -246,49 +275,201 @@ def compute_visual_speaking_intervals(
         for (tid, fi), prob in zip(crop_keys, probs):
             open_probs[tid][fi] = prob
 
-    win = vsdlm_detector.activity_window
-    thr = vsdlm_detector.activity_threshold
-    open_thr = vsdlm_detector.open_threshold
-    min_frames = (
-        max(1, int(round(vsdlm_detector.min_speak_duration_sec * fps)))
-        if vsdlm_detector.min_speak_duration_sec > 0
-        else 1
-    )
-
-    intervals: List[VisualInterval] = []
     for tid in track_ids:
-        probs = vsdlm_detector._invalidate_unstable_open_probs(
+        open_probs[tid] = vsdlm_detector._invalidate_unstable_open_probs(
             open_probs[tid],
             coord_streams[tid],
             shot_ids=shot_ids,
         )
-        motion = [False] * n
-        for i in range(n):
-            if not np.isfinite(probs[i]):
+    return open_probs, coord_streams
+
+
+def intervals_from_track_open_probs(
+    vsdlm_detector,
+    open_probs: Dict[int, List[float]],
+    coord_streams: Dict[int, List[BBox]],
+    *,
+    fps: float,
+    shot_ids: Sequence[int] | None = None,
+    min_speak_duration_sec: float | None = None,
+) -> List[VisualInterval]:
+    """Build per-track speaking intervals from precomputed open probs."""
+    n = 0
+    if open_probs:
+        n = len(next(iter(open_probs.values())))
+    fps = float(fps) if fps and fps > 0 else 25.0
+    min_speak = (
+        float(min_speak_duration_sec)
+        if min_speak_duration_sec is not None
+        else float(vsdlm_detector.min_speak_duration_sec)
+    )
+    intervals: List[VisualInterval] = []
+    for tid, probs in open_probs.items():
+        coords = coord_streams.get(tid) or [coord_placeholder] * n
+        mask, _ = vsdlm_detector.speaking_mask_from_open_probs(
+            probs,
+            coords,
+            fps=fps,
+            min_speak_duration_sec=min_speak,
+            shot_ids=shot_ids,
+        )
+        intervals.extend(
+            _mask_to_intervals(
+                mask, fps=fps, speaker_id=int(tid), shot_ids=shot_ids
+            )
+        )
+    intervals.sort(key=lambda x: (x[1], x[2], x[0]))
+    return intervals
+
+
+def any_track_speaking_mask(
+    vsdlm_detector,
+    open_probs: Dict[int, List[float]],
+    coord_streams: Dict[int, List[BBox]],
+    *,
+    fps: float,
+    min_speak_duration_sec: float,
+    shot_ids: Sequence[int] | None = None,
+) -> List[bool]:
+    """OR of per-track loose/strict speaking masks."""
+    n = 0
+    if open_probs:
+        n = len(next(iter(open_probs.values())))
+    out = [False] * n
+    for tid, probs in open_probs.items():
+        coords = coord_streams.get(tid) or [coord_placeholder] * n
+        mask, _ = vsdlm_detector.speaking_mask_from_open_probs(
+            probs,
+            coords,
+            fps=fps,
+            min_speak_duration_sec=min_speak_duration_sec,
+            shot_ids=shot_ids,
+        )
+        for i, v in enumerate(mask[:n]):
+            if v:
+                out[i] = True
+    return out
+
+
+def merge_primary_open_into_track(
+    open_probs: Dict[int, List[float]],
+    coord_streams: Dict[int, List[BBox]],
+    primary_id: Optional[int],
+    primary_open: Sequence[float],
+    primary_coords: Sequence[BBox],
+) -> None:
+    """Prefer MuseTalk dual-crop open scores on the matched primary track."""
+    if primary_id is None or primary_id not in open_probs:
+        return
+    n = len(open_probs[primary_id])
+    for i in range(min(n, len(primary_open), len(primary_coords))):
+        if primary_coords[i] == coord_placeholder:
+            continue
+        if not np.isfinite(primary_open[i]):
+            continue
+        # Keep track bbox if present; overlay higher-quality open.
+        open_probs[primary_id][i] = float(primary_open[i])
+        if coord_streams[primary_id][i] == coord_placeholder:
+            coord_streams[primary_id][i] = primary_coords[i]
+
+
+def pick_active_speaker_track(
+    frame_tracks: Sequence[Dict[int, BBox]],
+    open_probs: Dict[int, List[float]],
+    *,
+    shot_ids: Sequence[int] | None = None,
+    activity_window: int = 4,
+) -> List[Optional[int]]:
+    """Per frame, pick the face with strongest recent lip-open activity.
+
+    Used so multi-face shots follow the talking person (e.g. adult behind child)
+    instead of MuseTalk's size/center primary track.
+    """
+    n = len(frame_tracks)
+    win = max(1, int(activity_window))
+    out: List[Optional[int]] = [None] * n
+    for i in range(n):
+        tracks = frame_tracks[i]
+        if not tracks:
+            continue
+        cur_shot = int(shot_ids[i]) if shot_ids is not None else None
+        best_tid = None
+        best_key = None
+        for tid in tracks:
+            probs = open_probs.get(tid)
+            if not probs:
                 continue
-            cur_shot = int(shot_ids[i]) if shot_ids is not None else None
             finite = []
             for j in range(max(0, i - win), min(n, i + win + 1)):
                 if shot_ids is not None and int(shot_ids[j]) != cur_shot:
                     continue
-                if np.isfinite(probs[j]):
-                    finite.append(probs[j])
-            if len(finite) < 3:
+                if tid not in frame_tracks[j]:
+                    continue
+                v = probs[j] if j < len(probs) else float("nan")
+                if np.isfinite(v):
+                    finite.append(float(v))
+            if not finite:
                 continue
-            activity = float(np.std(finite))
             mean_open = float(np.mean(finite))
-            motion[i] = activity >= thr and mean_open >= open_thr
-        kept = vsdlm_detector._keep_runs_at_least(
-            motion, min_frames, shot_ids=shot_ids
-        )
-        intervals.extend(
-            _mask_to_intervals(
-                kept, fps=fps, speaker_id=int(tid), shot_ids=shot_ids
-            )
-        )
+            activity = float(np.std(finite)) if len(finite) >= 2 else 0.0
+            # Prefer high mean open, then activity, then current open.
+            cur = float(probs[i]) if i < len(probs) and np.isfinite(probs[i]) else 0.0
+            key = (mean_open, activity, cur)
+            if best_key is None or key > best_key:
+                best_key = key
+                best_tid = int(tid)
+        out[i] = best_tid
+    return out
 
-    intervals.sort(key=lambda x: (x[1], x[2], x[0]))
-    return intervals
+
+def open_presence_mask(
+    vsdlm_detector,
+    open_probs: Sequence[float],
+    coord_list: Sequence[BBox],
+    *,
+    fps: float,
+    min_speak_duration_sec: float,
+    shot_ids: Sequence[int] | None = None,
+    activity_window: int | None = None,
+) -> List[bool]:
+    """Sustained mouth-open evidence (no activity/std requirement).
+
+    Complements the activity gate: when lips stay fully open (open≈1), std
+    collapses and activity-based VSDLM falsely drops. Under VAD this open
+    presence is still a useful visual cue for the selected speaker.
+    """
+    n = len(coord_list)
+    if len(open_probs) != n:
+        raise ValueError("open_probs length must match coord_list")
+    win = max(1, int(activity_window or vsdlm_detector.activity_window))
+    open_thr = float(vsdlm_detector.open_threshold)
+    raw: List[bool] = []
+    for i in range(n):
+        if coord_list[i] == coord_placeholder or not np.isfinite(open_probs[i]):
+            raw.append(False)
+            continue
+        if float(open_probs[i]) < open_thr:
+            raw.append(False)
+            continue
+        cur_shot = int(shot_ids[i]) if shot_ids is not None else None
+        finite = []
+        for j in range(max(0, i - win), min(n, i + win + 1)):
+            if shot_ids is not None and int(shot_ids[j]) != cur_shot:
+                continue
+            if coord_list[j] == coord_placeholder:
+                continue
+            v = open_probs[j]
+            if np.isfinite(v):
+                finite.append(float(v))
+        if len(finite) < 2:
+            raw.append(False)
+            continue
+        raw.append(float(np.mean(finite)) >= open_thr)
+
+    fps = float(fps) if fps and fps > 0 else 25.0
+    duration = max(0.0, float(min_speak_duration_sec))
+    min_frames = max(1, int(round(duration * fps))) if duration > 0 else 1
+    return vsdlm_detector._keep_runs_at_least(raw, min_frames, shot_ids=shot_ids)
 
 
 def _speaker_switch_points(
@@ -499,6 +680,7 @@ def build_fused_speaking_mask(
     *,
     fps: float,
     vad_url: str | None = None,
+    vad_segments: Sequence[Tuple[float, float]] | None = None,
     detect_short_side: int = 720,
     min_face_area_ratio: float = 1.0 / 50.0,
     detect_stride: int = 3,
@@ -509,19 +691,20 @@ def build_fused_speaking_mask(
     mouth_coord_list: Sequence[Tuple[float, float, float, float] | None] | None = None,
     mouth_mar_list: Sequence[float | None] | None = None,
 ) -> Tuple[List[bool], dict]:
-    """VAD ∩ loose primary lip-motion, with multi-face exclusion.
+    """VAD ∩ lip-motion, with multi-face active-speaker selection.
 
     Policy
     ------
-    1. Score MuseTalk primary face once (batched VSDLM + dual-crop) → loose gate.
-    2. Multi-face SCRFD tracking (detect stride) + VSDLM only on non-primary
-       faces in multi-face frames → other-speaker exclusion / assign meta.
-    3. VAD → speech segments; assign/split to visual speakers for meta.
-    4. Primary lipsync frame iff:
-         - MuseTalk face present
+    1. Track all faces (SCRFD) within shot boundaries.
+    2. Score VSDLM open on **every** track (one batched pass).
+    3. Overlay MuseTalk dual-crop open onto the matched primary track.
+    4. Per frame, pick the track with strongest recent lip-open as the active
+       speaker (fixes adult-behind-child cases where primary is the child).
+    5. Frame is speaking iff:
          - audio VAD active
-         - primary face has *loose* VSDLM lip motion
-         - no *other* face has a strict visual speaking turn at this frame
+         - active speaker track has *loose* VSDLM lip motion **or**
+           sustained mouth-open (handles open-prob saturation)
+         - at least one face is present
 
     All face tracking / lip-motion analysis is confined within shot boundaries
     (``shot_ids`` or auto-detected cuts).
@@ -549,7 +732,16 @@ def build_fused_speaking_mask(
     )
     primary_id = match_primary_track_id(coord_list, frame_tracks)
 
-    # One primary pass: open scores → loose gate (+ strict intervals for meta).
+    # Score all tracks once, then derive loose/strict intervals.
+    open_probs, coord_streams = score_track_open_probs(
+        vsdlm_detector,
+        frame_list,
+        frame_tracks,
+        shot_ids=shot_ids,
+        only_multiface_frames=False,
+    )
+
+    # MuseTalk primary: dual-crop + MAR soft-closed (higher quality on that face).
     primary_open = vsdlm_detector.score_open_probs(
         frame_list,
         coord_list,
@@ -557,48 +749,86 @@ def build_fused_speaking_mask(
         mouth_mar_list=mouth_mar_list,
         shot_ids=shot_ids,
     )
-    primary_loose, _ = vsdlm_detector.speaking_mask_from_open_probs(
+    merge_primary_open_into_track(
+        open_probs,
+        coord_streams,
+        primary_id,
         primary_open,
         coord_list,
-        fps=fps,
-        min_speak_duration_sec=loose_min_speak_duration_sec,
-        shot_ids=shot_ids,
     )
-    primary_loose = primary_loose[:n]
-    primary_strict, _ = vsdlm_detector.speaking_mask_from_open_probs(
-        primary_open,
-        coord_list,
-        fps=fps,
-        min_speak_duration_sec=vsdlm_detector.min_speak_duration_sec,
+    # If MuseTalk primary never matched a SCRFD track, keep its scores under a
+    # synthetic id so single-face / unmatched cases still gate correctly.
+    synthetic_primary_id: Optional[int] = None
+    if primary_id is None and any(
+        c != coord_placeholder for c in coord_list
+    ):
+        synthetic_primary_id = -1
+        open_probs[synthetic_primary_id] = [
+            float(x) if np.isfinite(x) else float("nan") for x in primary_open
+        ]
+        coord_streams[synthetic_primary_id] = list(coord_list)
+
+    active_speaker = pick_active_speaker_track(
+        frame_tracks,
+        open_probs,
         shot_ids=shot_ids,
-    )
-    primary_intervals = (
-        _mask_to_intervals(
-            primary_strict,
-            fps=fps,
-            speaker_id=int(primary_id),
-            shot_ids=shot_ids,
-        )
-        if primary_id is not None
-        else []
+        activity_window=vsdlm_detector.activity_window,
     )
 
-    # Other faces: only multi-face frames, skip primary (already scored).
-    other_intervals = compute_visual_speaking_intervals(
+    loose_intervals = intervals_from_track_open_probs(
         vsdlm_detector,
-        frame_list,
-        frame_tracks,
+        open_probs,
+        coord_streams,
         fps=fps,
         shot_ids=shot_ids,
-        skip_track_ids=[primary_id] if primary_id is not None else None,
-        only_multiface_frames=True,
+        min_speak_duration_sec=loose_min_speak_duration_sec,
+    )
+    strict_intervals = intervals_from_track_open_probs(
+        vsdlm_detector,
+        open_probs,
+        coord_streams,
+        fps=fps,
+        shot_ids=shot_ids,
+        min_speak_duration_sec=vsdlm_detector.min_speak_duration_sec,
     )
     visual_intervals = sorted(
-        primary_intervals + other_intervals,
+        loose_intervals,
         key=lambda x: (x[1], x[2], x[0]),
     )
 
-    vad_segments = detect_voice_segments(audio_path, vad_url=vad_url)
+    # Per-track visual gates for active-speaker selection:
+    # activity-based loose OR sustained open (handles open-sat std collapse).
+    visual_by_track: Dict[int, List[bool]] = {}
+    for tid, probs in open_probs.items():
+        coords = coord_streams.get(tid) or [coord_placeholder] * n
+        activity_mask, _ = vsdlm_detector.speaking_mask_from_open_probs(
+            probs,
+            coords,
+            fps=fps,
+            min_speak_duration_sec=loose_min_speak_duration_sec,
+            shot_ids=shot_ids,
+        )
+        presence = open_presence_mask(
+            vsdlm_detector,
+            probs,
+            coords,
+            fps=fps,
+            min_speak_duration_sec=loose_min_speak_duration_sec,
+            shot_ids=shot_ids,
+        )
+        visual_by_track[int(tid)] = [
+            bool(a or p) for a, p in zip(activity_mask[:n], presence[:n])
+        ]
+
+    fallback_primary = (
+        primary_id if primary_id is not None else synthetic_primary_id
+    )
+
+    vad_segments = detect_voice_segments(
+        audio_path,
+        vad_url=vad_url,
+        vad_segments=vad_segments,
+    )
     assigned = fuse_vad_with_vsdlm(
         vad_segments,
         visual_intervals,
@@ -606,25 +836,48 @@ def build_fused_speaking_mask(
     )
     vad_mask = segments_to_frame_mask(vad_segments, n, fps)
 
-    # Exclude primary only while *another* face is visually speaking (strict turns).
-    other_visual = [False] * n
-    for sid, t0, t1 in other_intervals:
-        i0 = max(0, int(t0 * fps))
-        i1 = min(n, int(round(t1 * fps)))
-        for i in range(i0, i1):
-            other_visual[i] = True
-
     mask = [False] * n
+    active_loose_frames = 0
     for i in range(n):
-        if coord_list[i] == coord_placeholder:
-            continue
         if not vad_mask[i]:
             continue
-        if other_visual[i]:
+        if not frame_tracks[i] and coord_list[i] == coord_placeholder:
             continue
-        if not primary_loose[i]:
+        sid = active_speaker[i]
+        # Fallback: if activity picker has no score yet, use MuseTalk primary.
+        if sid is None:
+            sid = fallback_primary
+        if sid is None:
+            continue
+        track_visual = visual_by_track.get(int(sid))
+        if not track_visual or not track_visual[i]:
             continue
         mask[i] = True
+        active_loose_frames += 1
+
+    # Meta: other-face strict turns vs MuseTalk primary (diagnostics only).
+    other_visual = [False] * n
+    if primary_id is not None:
+        for sid, t0, t1 in strict_intervals:
+            if int(sid) == int(primary_id):
+                continue
+            i0 = max(0, int(t0 * fps))
+            i1 = min(n, int(round(t1 * fps)))
+            for i in range(i0, i1):
+                other_visual[i] = True
+
+    primary_loose_count = 0
+    if fallback_primary is not None and fallback_primary in visual_by_track:
+        primary_loose_count = sum(visual_by_track[int(fallback_primary)])
+
+    # How often active speaker differs from MuseTalk primary on speaking frames.
+    switched = 0
+    for i, v in enumerate(mask):
+        if not v:
+            continue
+        if active_speaker[i] is not None and fallback_primary is not None:
+            if int(active_speaker[i]) != int(fallback_primary):
+                switched += 1
 
     meta = {
         "n_face_tracks": n_tracks,
@@ -637,7 +890,9 @@ def build_fused_speaking_mask(
         "assigned_segments": assigned,
         "loose_min_speak_duration_sec": loose_min_speak_duration_sec,
         "max_assign_gap_sec": max_assign_gap_sec,
-        "primary_loose_frames": sum(primary_loose),
+        "primary_loose_frames": primary_loose_count,
+        "active_speaker_loose_frames": active_loose_frames,
+        "active_speaker_switched_frames": switched,
         "vad_frames": sum(vad_mask),
         "other_speaker_frames": sum(other_visual),
         "raw_speaking_frames": sum(mask),
@@ -645,11 +900,12 @@ def build_fused_speaking_mask(
         "shot_ids": list(shot_ids) if shot_ids is not None else None,
         "detect_stride": int(detect_stride),
         "vsdlm_providers": list(getattr(vsdlm_detector, "providers", [])),
+        "speaker_select": "lip_activity",
     }
     logger.info(
         "VAD∩VSDLM fusion: shots=%d tracks=%d visual_iv=%d vad=%d/%d assigned=%d "
-        "primary=%s loose=%d other_visual=%d raw=%d/%d "
-        "(detect_stride=%d, vsdlm=%s)",
+        "primary=%s active_loose=%d switched=%d other_visual=%d raw=%d/%d "
+        "(detect_stride=%d, select=lip_activity, vsdlm=%s)",
         n_shots,
         n_tracks,
         len(visual_intervals),
@@ -657,7 +913,8 @@ def build_fused_speaking_mask(
         n,
         len(assigned),
         primary_id,
-        sum(primary_loose),
+        active_loose_frames,
+        switched,
         sum(other_visual),
         sum(mask),
         n,

@@ -20,6 +20,23 @@ _engine_pool: Optional[EnginePool] = None
 
 def _load_service_config() -> ServiceConfig:
     config = ServiceConfig()
+
+    lipsync_backend = os.environ.get("MUSETALK_LIPSYNC_BACKEND")
+    if lipsync_backend:
+        config.lipsync_backend = lipsync_backend.strip().lower()
+
+    ls_ckpt = os.environ.get("MUSETALK_LATENTSYNC_CKPT")
+    if ls_ckpt:
+        config.latentsync_ckpt = ls_ckpt
+
+    ls_steps = os.environ.get("MUSETALK_LATENTSYNC_STEPS")
+    if ls_steps is not None:
+        config.latentsync_inference_steps = max(1, int(ls_steps))
+
+    ls_guidance = os.environ.get("MUSETALK_LATENTSYNC_GUIDANCE")
+    if ls_guidance is not None:
+        config.latentsync_guidance_scale = float(ls_guidance)
+
     max_concurrent = os.environ.get("MUSETALK_MAX_CONCURRENT")
     if max_concurrent is not None:
         config.max_concurrent_requests = max(2, int(max_concurrent))
@@ -200,6 +217,13 @@ class LipSyncRequest(BaseModel):
         None,
         description="Segment length in seconds for long videos (default: 60)",
     )
+    VAD_result: Optional[str] = Field(
+        None,
+        description=(
+            "Optional JSON string: array of {start,end} (seconds) speech segments. "
+            "When set, skips remote VAD and uses these times (absolute to the full audio)."
+        ),
+    )
 
 
 class LipSyncResponse(BaseModel):
@@ -252,15 +276,25 @@ async def health():
 @app.post("/lipsync", response_model=LipSyncResponse)
 async def lipsync(request: LipSyncRequest):
     logger.info(
-        "Received lipsync request: video_path=%s audio_path=%s output_path=%s",
+        "Received lipsync request: video_path=%s audio_path=%s output_path=%s VAD_result=%s",
         request.video_path,
         request.audio_path,
         request.output_path,
+        "yes" if request.VAD_result else "no",
     )
 
     if _engine_pool is None:
         logger.error("Inference engine pool is not initialized")
         raise HTTPException(status_code=503, detail="Inference engine is not ready")
+
+    vad_segments = None
+    if request.VAD_result is not None and str(request.VAD_result).strip():
+        from musetalk.utils.vad_client import parse_vad_result
+
+        try:
+            vad_segments = parse_vad_result(request.VAD_result)
+        except ValueError as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
 
     async with _engine_pool.borrow() as engine:
         try:
@@ -271,6 +305,7 @@ async def lipsync(request: LipSyncRequest):
                 request.output_path,
                 force_chunk=request.force_chunk,
                 chunk_duration_sec=request.chunk_duration_sec,
+                vad_segments=vad_segments,
             )
             logger.info(
                 "Lipsync request succeeded: output_path=%s frame_count=%s speaking_frames=%s lipsync_frames=%s chunked=%s chunk_count=%s",

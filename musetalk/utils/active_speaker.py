@@ -795,14 +795,21 @@ def detect_shot_ids(
     frames: Sequence[np.ndarray],
     *,
     hist_threshold: float = 0.45,
+    hist_soft_threshold: float = 0.30,
+    gray_mae_threshold: float = 25.0,
     min_shot_len: int = 3,
     sample_short_side: int = 160,
 ) -> List[int]:
-    """Assign a shot id to each frame via consecutive HSV-histogram differences.
+    """Assign a shot id to each frame via adjacent-frame cut detection.
 
-    A cut is declared when Bhattacharyya distance between adjacent-frame
-    histograms exceeds ``hist_threshold``. Cuts closer than ``min_shot_len``
-    frames are ignored to reduce flicker false positives.
+    A cut is declared when either:
+      1. HSV histogram Bhattacharyya distance >= ``hist_threshold``, or
+      2. distance >= ``hist_soft_threshold`` **and** grayscale mean-abs-diff
+         >= ``gray_mae_threshold`` (catches hard cuts that keep a similar
+         color palette, e.g. palace interiors / same costume tones).
+
+    Cuts closer than ``min_shot_len`` frames are ignored to reduce flicker
+    false positives.
     """
     n = len(frames)
     if n == 0:
@@ -810,17 +817,20 @@ def detect_shot_ids(
     if n == 1:
         return [0]
 
-    def _hist(frame: np.ndarray) -> np.ndarray:
+    def _resize(frame: np.ndarray) -> np.ndarray:
         h, w = frame.shape[:2]
         short = min(h, w)
         if sample_short_side > 0 and short > sample_short_side:
             scale = float(sample_short_side) / float(short)
-            frame = cv2.resize(
+            return cv2.resize(
                 frame,
                 (max(1, int(round(w * scale))), max(1, int(round(h * scale)))),
                 interpolation=cv2.INTER_AREA,
             )
-        hsv = cv2.cvtColor(frame, cv2.COLOR_BGR2HSV)
+        return frame
+
+    def _hist(frame_small: np.ndarray) -> np.ndarray:
+        hsv = cv2.cvtColor(frame_small, cv2.COLOR_BGR2HSV)
         hist = cv2.calcHist([hsv], [0, 1], None, [32, 32], [0, 180, 0, 256])
         cv2.normalize(hist, hist, alpha=0, beta=1, norm_type=cv2.NORM_MINMAX)
         return hist
@@ -828,12 +838,27 @@ def detect_shot_ids(
     shot_ids = [0] * n
     current = 0
     last_cut = 0
-    prev_hist = _hist(frames[0])
+    prev_small = _resize(frames[0])
+    prev_hist = _hist(prev_small)
+    prev_gray = cv2.cvtColor(prev_small, cv2.COLOR_BGR2GRAY).astype(np.float32)
+    soft_thr = float(hist_soft_threshold) if hist_soft_threshold is not None else 0.0
+    mae_thr = float(gray_mae_threshold) if gray_mae_threshold is not None else 0.0
     for i in range(1, n):
-        hist = _hist(frames[i])
+        small = _resize(frames[i])
+        hist = _hist(small)
+        gray = cv2.cvtColor(small, cv2.COLOR_BGR2GRAY).astype(np.float32)
         dist = float(cv2.compareHist(prev_hist, hist, cv2.HISTCMP_BHATTACHARYYA))
+        mae = float(np.mean(np.abs(prev_gray - gray)))
         prev_hist = hist
-        if dist >= hist_threshold and (i - last_cut) >= min_shot_len:
+        prev_gray = gray
+        hard = dist >= float(hist_threshold)
+        soft = (
+            soft_thr > 0
+            and mae_thr > 0
+            and dist >= soft_thr
+            and mae >= mae_thr
+        )
+        if (hard or soft) and (i - last_cut) >= min_shot_len:
             current += 1
             last_cut = i
         shot_ids[i] = current

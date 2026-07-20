@@ -84,10 +84,12 @@ class ServiceConfig:
     # Landmark MAR rescue when VSDLM under-scores slightly-open speaking.
     # When MAR >= this, also score a face-band crop and take max(open).
     vsdlm_mar_open_threshold: float = 0.12
-    # Unused by dual-crop rescue; kept for env/API compatibility.
+    # Landmark MAR activity used when VSDLM open saturates (sustained open).
     vsdlm_mar_activity_threshold: float = 0.04
     # Soft attenuate VSDLM open when landmark MAR is below this (0 = off).
-    vsdlm_soft_closed_mar: float = 0.06
+    # 0.12 suppresses closed/near-closed false opens (e.g. red-lipstick crops
+    # that VSDLM scores ~0.7 while MAR≈0.05); 0.06 was too weak for that.
+    vsdlm_soft_closed_mar: float = 0.12
     # Batched ONNX inference size for VSDLM open scoring.
     vsdlm_batch_size: int = 64
     # Fuse TenVAD speech segments with multi-face VSDLM (assign + split at switches).

@@ -412,9 +412,9 @@ def pick_active_speaker_track(
                 continue
             mean_open = float(np.mean(finite))
             activity = float(np.std(finite)) if len(finite) >= 2 else 0.0
-            # Prefer high mean open, then activity, then current open.
+            # Prefer lip motion (std), then mean open, then current open.
             cur = float(probs[i]) if i < len(probs) and np.isfinite(probs[i]) else 0.0
-            key = (mean_open, activity, cur)
+            key = (activity, mean_open, cur)
             if best_key is None or key > best_key:
                 best_key = key
                 best_tid = int(tid)
@@ -691,23 +691,18 @@ def build_fused_speaking_mask(
     mouth_coord_list: Sequence[Tuple[float, float, float, float] | None] | None = None,
     mouth_mar_list: Sequence[float | None] | None = None,
 ) -> Tuple[List[bool], dict]:
-    """VAD ∩ lip-motion, with multi-face active-speaker selection.
+    """VAD ∩ lip-motion on the MuseTalk primary face.
 
     Policy
     ------
-    1. Track all faces (SCRFD) within shot boundaries.
-    2. Score VSDLM open on **every** track (one batched pass).
-    3. Overlay MuseTalk dual-crop open onto the matched primary track.
-    4. Per frame, pick the track with strongest recent lip-open as the active
-       speaker (fixes adult-behind-child cases where primary is the child).
-    5. Frame is speaking iff:
+    1. Track all faces (SCRFD) within shot boundaries (for diagnostics / assign).
+    2. Score VSDLM open on every track; overlay MuseTalk dual-crop on primary.
+    3. Pick an "active speaker" by lip activity for logging only.
+    4. Frame is speaking iff:
          - audio VAD active
-         - active speaker track has *loose* VSDLM lip motion **or**
-           sustained mouth-open (handles open-prob saturation)
-         - at least one face is present
-
-    All face tracking / lip-motion analysis is confined within shot boundaries
-    (``shot_ids`` or auto-detected cuts).
+         - MuseTalk **primary** face is present
+         - primary has lip **motion** (open-prob std, or MAR std when the
+           mouth stays open and VSDLM open saturates). Static open never passes.
     """
     from musetalk.utils.active_speaker import detect_shot_ids
     from musetalk.utils.vad_client import segments_to_frame_mask
@@ -796,33 +791,28 @@ def build_fused_speaking_mask(
         key=lambda x: (x[1], x[2], x[0]),
     )
 
-    # Per-track visual gates for active-speaker selection:
-    # activity-based loose OR sustained open (handles open-sat std collapse).
-    visual_by_track: Dict[int, List[bool]] = {}
-    for tid, probs in open_probs.items():
-        coords = coord_streams.get(tid) or [coord_placeholder] * n
-        activity_mask, _ = vsdlm_detector.speaking_mask_from_open_probs(
-            probs,
-            coords,
-            fps=fps,
-            min_speak_duration_sec=loose_min_speak_duration_sec,
-            shot_ids=shot_ids,
-        )
-        presence = open_presence_mask(
-            vsdlm_detector,
-            probs,
-            coords,
-            fps=fps,
-            min_speak_duration_sec=loose_min_speak_duration_sec,
-            shot_ids=shot_ids,
-        )
-        visual_by_track[int(tid)] = [
-            bool(a or p) for a, p in zip(activity_mask[:n], presence[:n])
-        ]
-
     fallback_primary = (
         primary_id if primary_id is not None else synthetic_primary_id
     )
+
+    # Primary visual gate: require lip motion. Sustained-open mouths may use
+    # softer open-std or landmark MAR std (open often saturates at ~1).
+    primary_visual = [False] * n
+    if fallback_primary is not None and fallback_primary in open_probs:
+        p_coords = coord_streams.get(fallback_primary) or [coord_placeholder] * n
+        p_probs = open_probs[fallback_primary]
+        primary_visual, _ = vsdlm_detector.speaking_mask_from_open_probs(
+            p_probs,
+            p_coords,
+            fps=fps,
+            min_speak_duration_sec=loose_min_speak_duration_sec,
+            shot_ids=shot_ids,
+            soft_open_mean=0.75,
+            soft_activity_threshold=0.05,
+            mouth_mar_list=mouth_mar_list,
+            mar_activity_threshold=vsdlm_detector.mar_activity_threshold,
+        )
+        primary_visual = list(primary_visual[:n])
 
     vad_segments = detect_voice_segments(
         audio_path,
@@ -837,23 +827,16 @@ def build_fused_speaking_mask(
     vad_mask = segments_to_frame_mask(vad_segments, n, fps)
 
     mask = [False] * n
-    active_loose_frames = 0
+    primary_loose_frames = 0
     for i in range(n):
         if not vad_mask[i]:
             continue
-        if not frame_tracks[i] and coord_list[i] == coord_placeholder:
+        if coord_list[i] == coord_placeholder:
             continue
-        sid = active_speaker[i]
-        # Fallback: if activity picker has no score yet, use MuseTalk primary.
-        if sid is None:
-            sid = fallback_primary
-        if sid is None:
-            continue
-        track_visual = visual_by_track.get(int(sid))
-        if not track_visual or not track_visual[i]:
+        if not primary_visual[i]:
             continue
         mask[i] = True
-        active_loose_frames += 1
+        primary_loose_frames += 1
 
     # Meta: other-face strict turns vs MuseTalk primary (diagnostics only).
     other_visual = [False] * n
@@ -866,11 +849,7 @@ def build_fused_speaking_mask(
             for i in range(i0, i1):
                 other_visual[i] = True
 
-    primary_loose_count = 0
-    if fallback_primary is not None and fallback_primary in visual_by_track:
-        primary_loose_count = sum(visual_by_track[int(fallback_primary)])
-
-    # How often active speaker differs from MuseTalk primary on speaking frames.
+    # How often activity-picker disagrees with primary on speaking frames.
     switched = 0
     for i, v in enumerate(mask):
         if not v:
@@ -890,8 +869,8 @@ def build_fused_speaking_mask(
         "assigned_segments": assigned,
         "loose_min_speak_duration_sec": loose_min_speak_duration_sec,
         "max_assign_gap_sec": max_assign_gap_sec,
-        "primary_loose_frames": primary_loose_count,
-        "active_speaker_loose_frames": active_loose_frames,
+        "primary_loose_frames": primary_loose_frames,
+        "active_speaker_loose_frames": primary_loose_frames,
         "active_speaker_switched_frames": switched,
         "vad_frames": sum(vad_mask),
         "other_speaker_frames": sum(other_visual),
@@ -900,12 +879,12 @@ def build_fused_speaking_mask(
         "shot_ids": list(shot_ids) if shot_ids is not None else None,
         "detect_stride": int(detect_stride),
         "vsdlm_providers": list(getattr(vsdlm_detector, "providers", [])),
-        "speaker_select": "lip_activity",
+        "speaker_select": "primary",
     }
     logger.info(
         "VAD∩VSDLM fusion: shots=%d tracks=%d visual_iv=%d vad=%d/%d assigned=%d "
-        "primary=%s active_loose=%d switched=%d other_visual=%d raw=%d/%d "
-        "(detect_stride=%d, select=lip_activity, vsdlm=%s)",
+        "primary=%s primary_loose=%d picker_disagree=%d other_visual=%d raw=%d/%d "
+        "(detect_stride=%d, select=primary, vsdlm=%s)",
         n_shots,
         n_tracks,
         len(visual_intervals),
@@ -913,7 +892,7 @@ def build_fused_speaking_mask(
         n,
         len(assigned),
         primary_id,
-        active_loose_frames,
+        primary_loose_frames,
         switched,
         sum(other_visual),
         sum(mask),

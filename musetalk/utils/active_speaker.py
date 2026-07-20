@@ -368,9 +368,9 @@ class VSDLMDetector:
         # window mean; FP whole-shot fill is controlled by expand min-run.
         temporal_max_radius: int = 2,
         # Soft closed-mouth assist: when landmark MAR < this, linearly attenuate
-        # open (mar=0 → open=0, mar=thr → unchanged). Kills VSDLM FPs on clearly
-        # closed lips without the old hard veto at higher MAR (~0.10).
-        soft_closed_mar: float = 0.06,
+        # open (mar=0 → open=0, mar=thr → unchanged). Default 0.12 kills VSDLM
+        # FPs on closed/near-closed lips (e.g. lipstick crops); 0.06 was too weak.
+        soft_closed_mar: float = 0.12,
         batch_size: int = 64,
         providers: Sequence[str] | None = None,
     ):
@@ -680,8 +680,20 @@ class VSDLMDetector:
         min_speak_duration_sec: float | None = None,
         identity_min_iou: float = 0.5,
         shot_ids: Sequence[int] | None = None,
+        activity_threshold: float | None = None,
+        soft_open_mean: float | None = 0.75,
+        soft_activity_threshold: float | None = 0.05,
+        mouth_mar_list: Sequence[float | None] | None = None,
+        mar_activity_threshold: float | None = None,
     ) -> Tuple[List[bool], List[float]]:
-        """Convert open probs → activity gate + min-run speaking mask."""
+        """Convert open probs → activity gate + min-run speaking mask.
+
+        Always requires lip motion. Normal path uses open-prob std.
+        When the mouth is sustained open (``mean_open >= soft_open_mean``),
+        VSDLM open often saturates at ~1 so std≈0 even while lips move;
+        then either a softer open-std bar **or** landmark MAR std counts as
+        motion. Static open (open-std≈0 and MAR-std≈0) never passes.
+        """
         from musetalk.utils.preprocessing import _bbox_iou
 
         n = len(coord_list)
@@ -689,11 +701,34 @@ class VSDLMDetector:
             raise ValueError("open_probs length must match coord_list")
         if shot_ids is not None and len(shot_ids) != n:
             raise ValueError("shot_ids length must match coord_list")
+        if mouth_mar_list is not None and len(mouth_mar_list) != n:
+            raise ValueError("mouth_mar_list length must match coord_list")
 
         win = self.activity_window
-        # Mean-open uses the activity threshold (slightly softer than open_thr)
-        # so a sharp open peak is not rejected solely because neighbors are low.
-        mean_thr = self.activity_threshold
+        act_thr = (
+            float(activity_threshold)
+            if activity_threshold is not None
+            else float(self.activity_threshold)
+        )
+        soft_mean = (
+            float(soft_open_mean)
+            if soft_open_mean is not None and soft_open_mean > 0
+            else 0.0
+        )
+        soft_act = (
+            float(soft_activity_threshold)
+            if soft_activity_threshold is not None
+            else act_thr
+        )
+        # Soft bar must stay strictly positive so zero-motion never passes.
+        soft_act = max(1e-4, soft_act)
+        mar_thr = (
+            float(mar_activity_threshold)
+            if mar_activity_threshold is not None
+            else float(self.mar_activity_threshold)
+        )
+        mar_thr = max(0.0, mar_thr)
+
         motion_mask: List[bool] = []
         activity_scores: List[float] = []
         for i in range(n):
@@ -703,7 +738,8 @@ class VSDLMDetector:
                 continue
             cur = coord_list[i]
             cur_shot = int(shot_ids[i]) if shot_ids is not None else None
-            finite = []
+            finite: List[float] = []
+            mars: List[float] = []
             for j in range(max(0, i - win), min(n, i + win + 1)):
                 if shot_ids is not None and int(shot_ids[j]) != cur_shot:
                     continue
@@ -713,21 +749,38 @@ class VSDLMDetector:
                     continue
                 if j != i and _bbox_iou(cur, coord_list[j]) < identity_min_iou:
                     continue
-                finite.append(open_probs[j])
+                finite.append(float(open_probs[j]))
+                if mouth_mar_list is not None and mouth_mar_list[j] is not None:
+                    mj = float(mouth_mar_list[j])
+                    if np.isfinite(mj):
+                        mars.append(mj)
             if len(finite) < 3:
                 activity = 0.0
                 mean_open = 0.0
             else:
                 activity = float(np.std(finite))
                 mean_open = float(np.mean(finite))
-            motion_mask.append(
-                bool(
-                    open_probs[i] >= self.open_threshold
-                    and activity >= self.activity_threshold
-                    and mean_open >= mean_thr
+            mar_activity = float(np.std(mars)) if len(mars) >= 3 else 0.0
+
+            open_ok = float(open_probs[i]) >= self.open_threshold
+            if soft_mean > 0 and mean_open >= soft_mean:
+                # Sustained open: soft open-std OR MAR motion (saturation-safe).
+                lip_motion = activity >= soft_act or (
+                    mar_thr > 0 and mar_activity >= mar_thr
                 )
+                frame_ok = open_ok and lip_motion
+            else:
+                frame_ok = bool(
+                    open_ok
+                    and activity >= act_thr
+                    and mean_open >= act_thr
+                )
+
+            motion_mask.append(bool(frame_ok))
+            # Prefer the signal that actually fired for diagnostics.
+            activity_scores.append(
+                max(activity, mar_activity) if frame_ok else activity
             )
-            activity_scores.append(activity)
 
         fps = float(fps) if fps and fps > 0 else LR_ASD_FPS
         duration = (
@@ -770,7 +823,6 @@ class VSDLMDetector:
         are discarded.
         """
         del audio_path  # visual-only; kept for call-site compatibility
-        del mar_activity_threshold  # retained for API compat
 
         open_probs = self.score_open_probs(
             frame_list,
@@ -788,6 +840,8 @@ class VSDLMDetector:
             min_speak_duration_sec=min_speak_duration_sec,
             identity_min_iou=identity_min_iou,
             shot_ids=shot_ids,
+            mouth_mar_list=mouth_mar_list,
+            mar_activity_threshold=mar_activity_threshold,
         )
 
 

@@ -3,10 +3,10 @@
 
 import os
 import time
-
+import json
 import requests
 
-base_url = "http://10.206.16.6:8765"
+base_url = "http://127.0.0.1:8765"
 
 def check_health(base_url: str, timeout: float) -> dict:
     url = f"{base_url.rstrip('/')}/health"
@@ -60,6 +60,19 @@ def run_lipsync(
         return bool(data.get("success"))
     except Exception:
         return False
+     
+     
+def get_vad_result_from_intermediate_file(intermediate_file_path: str) -> str:
+    ret = []
+    with open(intermediate_file_path, "r") as f:
+        intermediate_data = json.load(f)
+        if 'sentence_list' in intermediate_data:
+            sentence_list = intermediate_data["sentence_list"]
+            for sentence in sentence_list:
+                ret.append({'start':sentence["start"]/1000.0, 'end':sentence["end"]/1000.0)})
+    return json.dumps(ret)
+
+
 
 
 if __name__ == "__main__":
@@ -77,12 +90,19 @@ if __name__ == "__main__":
     audio = '/opt/oss/wujiedub/video_translate/20260719/13/1088/category_task/1346/83366/translated_voice.wav'
     audio = '/opt/oss/wujiedub/video_translate/20260719/21/1088/category_task/1368/84977/translated_voice.wav'
     output = '/home/ubuntu/raoyonghui/MuseTalk/test_output.mp4'
+
+    intermediate_file_path = '/opt/oss/wujiedub/video_translate/20260719/21/1088/category_task/1368/84977/intermediate_result.json'
+
+    vad_result = get_vad_result_from_intermediate_file(intermediate_file_path)
+
+    print(f"vad_result: {vad_result}")
     ok = run_lipsync(
         base_url,
         video,
         audio,
         output,
         timeout=9600,
+        VAD_result = vad_result,
     )
     elapsed = time.time() - started
 

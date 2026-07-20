@@ -241,6 +241,7 @@ class LatentSyncBackend:
         if not runs:
             return {}
 
+        fps = float(fps) if fps and fps > 0 else 25.0
         os.makedirs(temp_dir, exist_ok=True)
         out: Dict[int, np.ndarray] = {}
         logger.info(

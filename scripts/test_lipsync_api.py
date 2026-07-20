@@ -69,7 +69,7 @@ def get_vad_result_from_intermediate_file(intermediate_file_path: str) -> str:
         if 'sentence_list' in intermediate_data:
             sentence_list = intermediate_data["sentence_list"]
             for sentence in sentence_list:
-                ret.append({'start':sentence["start"]/1000.0, 'end':sentence["end"]/1000.0)})
+                ret.append({'start':sentence["start"]/1000.0, 'end':sentence["end"]/1000.0})
     return json.dumps(ret)
 
 

@@ -1,7 +1,7 @@
 import math
 import os
 import sys
-from typing import List, Sequence, Tuple
+from typing import List, Optional, Sequence, Tuple
 
 import cv2
 import numpy as np
@@ -987,6 +987,144 @@ def dilate_speaking_mask(
                 continue
             dilated[j] = True
     return dilated
+
+
+def _contiguous_true_runs(
+    speaking_mask: Sequence[bool],
+    shot_ids: Sequence[int] | None = None,
+) -> List[Tuple[int, int]]:
+    """Inclusive (start, end) True runs; split when shot id changes."""
+    n = len(speaking_mask)
+    runs: List[Tuple[int, int]] = []
+    i = 0
+    while i < n:
+        if not speaking_mask[i]:
+            i += 1
+            continue
+        j = i + 1
+        while j < n and speaking_mask[j]:
+            if shot_ids is not None and int(shot_ids[j]) != int(shot_ids[i]):
+                break
+            j += 1
+        runs.append((i, j - 1))
+        i = j
+    return runs
+
+
+def _shot_ranges(
+    shot_ids: Sequence[int],
+) -> dict[int, Tuple[int, int]]:
+    """Map shot id → half-open [start, end) frame range."""
+    n = len(shot_ids)
+    out: dict[int, Tuple[int, int]] = {}
+    i = 0
+    while i < n:
+        sid = int(shot_ids[i])
+        j = i + 1
+        while j < n and int(shot_ids[j]) == sid:
+            j += 1
+        out[sid] = (i, j)
+        i = j
+    return out
+
+
+def _vad_frame_bounds_for_run(
+    run_start: int,
+    run_end: int,
+    vad_segments: Sequence[Tuple[float, float]],
+    *,
+    fps: float,
+    n_frames: int,
+) -> Optional[Tuple[int, int]]:
+    """Half-open [v0, v1) of the VAD segment that best contains this run.
+
+    Returns None when the run is not inside any VAD segment (no overlap).
+    """
+    if not vad_segments or fps <= 0:
+        return None
+    t0 = run_start / fps
+    t1 = (run_end + 1) / fps
+    best: Optional[Tuple[float, float]] = None
+    best_overlap = 0.0
+    for vs, ve in vad_segments:
+        vs_f, ve_f = float(vs), float(ve)
+        if ve_f <= vs_f:
+            continue
+        o0, o1 = max(t0, vs_f), min(t1, ve_f)
+        overlap = o1 - o0
+        if overlap > best_overlap:
+            best_overlap = overlap
+            best = (vs_f, ve_f)
+    if best is None or best_overlap <= 0:
+        return None
+    # Require the speaking run to mostly sit inside the VAD ("处在…中").
+    run_dur = max(t1 - t0, 1e-6)
+    if best_overlap / run_dur < 0.5:
+        return None
+    v0 = max(0, int(round(best[0] * fps)))
+    v1 = min(n_frames, int(round(best[1] * fps)))
+    if v1 <= v0:
+        return None
+    return v0, v1
+
+
+def expand_speaking_mask_within_vad(
+    speaking_mask: Sequence[bool],
+    vad_segments: Sequence[Tuple[float, float]],
+    *,
+    fps: float,
+    max_expand_sec: float = 3.0,
+    shot_ids: Sequence[int] | None = None,
+    valid_face: Sequence[bool] | None = None,
+) -> List[bool]:
+    """Expand each speaking run toward its parent VAD segment.
+
+    For every contiguous speaking run that falls inside a VAD segment:
+    - expand up to ``max_expand_sec`` on **each** side
+    - never past the parent VAD bounds
+    - never across shot cuts when ``shot_ids`` is provided
+    - frames without a valid face stay False when ``valid_face`` is set
+
+    Runs with no containing VAD are left unchanged.
+    """
+    n = len(speaking_mask)
+    out = list(speaking_mask)
+    if n == 0 or max_expand_sec <= 0 or not vad_segments:
+        return out
+
+    fps = float(fps) if fps and fps > 0 else LR_ASD_FPS
+    max_pad = max(0, int(round(float(max_expand_sec) * fps)))
+    if max_pad <= 0:
+        return out
+
+    if shot_ids is not None and len(shot_ids) != n:
+        raise ValueError("shot_ids length must match speaking_mask")
+    if valid_face is not None and len(valid_face) != n:
+        raise ValueError("valid_face length must match speaking_mask")
+
+    shot_range = _shot_ranges(shot_ids) if shot_ids is not None else {}
+    runs = _contiguous_true_runs(speaking_mask, shot_ids=shot_ids)
+
+    for rs, re in runs:
+        vad_bounds = _vad_frame_bounds_for_run(
+            rs, re, vad_segments, fps=fps, n_frames=n
+        )
+        if vad_bounds is None:
+            continue
+        v0, v1 = vad_bounds  # half-open
+        lo = max(0, rs - max_pad, v0)
+        hi = min(n - 1, re + max_pad, v1 - 1)  # inclusive
+        if shot_ids is not None:
+            s0, s1 = shot_range[int(shot_ids[rs])]
+            lo = max(lo, s0)
+            hi = min(hi, s1 - 1)
+        if hi < lo:
+            continue
+        for j in range(lo, hi + 1):
+            if valid_face is not None and not valid_face[j]:
+                continue
+            out[j] = True
+    return out
 
 
 def expand_speaking_mask_to_shots(

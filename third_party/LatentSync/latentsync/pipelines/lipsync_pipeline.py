@@ -326,32 +326,24 @@ class LipsyncPipeline(DiffusionPipeline):
         return np.stack(out_frames, axis=0)
 
     def loop_video(self, whisper_chunks: list, video_frames: np.ndarray):
-        # If the audio is longer than the video, we need to loop the video
-        if len(whisper_chunks) > len(video_frames):
+        # If audio/whisper is longer than the video, pad by repeating the last
+        # frame. Never ping-pong reverse: that looks like the timeline jumping
+        # backward a few frames in the middle of a speaking segment.
+        n_video = len(video_frames)
+        n_audio = len(whisper_chunks)
+        if n_audio > n_video:
             faces, boxes, affine_matrices = self.affine_transform_video(video_frames)
-            num_loops = math.ceil(len(whisper_chunks) / len(video_frames))
-            loop_video_frames = []
-            loop_faces = []
-            loop_boxes = []
-            loop_affine_matrices = []
-            for i in range(num_loops):
-                if i % 2 == 0:
-                    loop_video_frames.append(video_frames)
-                    loop_faces.append(faces)
-                    loop_boxes += boxes
-                    loop_affine_matrices += affine_matrices
-                else:
-                    loop_video_frames.append(video_frames[::-1])
-                    loop_faces.append(faces.flip(0))
-                    loop_boxes += boxes[::-1]
-                    loop_affine_matrices += affine_matrices[::-1]
-
-            video_frames = np.concatenate(loop_video_frames, axis=0)[: len(whisper_chunks)]
-            faces = torch.cat(loop_faces, dim=0)[: len(whisper_chunks)]
-            boxes = loop_boxes[: len(whisper_chunks)]
-            affine_matrices = loop_affine_matrices[: len(whisper_chunks)]
+            pad = n_audio - n_video
+            last_face = faces[-1:].repeat(pad, 1, 1, 1)
+            faces = torch.cat([faces, last_face], dim=0)
+            boxes = boxes + [boxes[-1]] * pad
+            affine_matrices = affine_matrices + [affine_matrices[-1]] * pad
+            video_frames = np.concatenate(
+                [video_frames, np.repeat(video_frames[-1:], pad, axis=0)],
+                axis=0,
+            )
         else:
-            video_frames = video_frames[: len(whisper_chunks)]
+            video_frames = video_frames[:n_audio]
             faces, boxes, affine_matrices = self.affine_transform_video(video_frames)
 
         return video_frames, faces, boxes, affine_matrices
@@ -363,7 +355,7 @@ class LipsyncPipeline(DiffusionPipeline):
         audio_path: str,
         video_out_path: str,
         num_frames: int = 16,
-        video_fps: int = 25,
+        video_fps: float = 25,
         audio_sample_rate: int = 16000,
         height: Optional[int] = None,
         width: Optional[int] = None,
@@ -416,7 +408,16 @@ class LipsyncPipeline(DiffusionPipeline):
         whisper_chunks = self.audio_encoder.feature2chunks(feature_array=whisper_feature, fps=video_fps)
 
         audio_samples = read_audio(audio_path)
-        video_frames = read_video(video_path, use_decord=False)
+        # Do not re-encode with ffmpeg -r 25: that drops/duplicates frames on
+        # short gated clips and then triggers audio/video length mismatch.
+        video_frames = read_video(video_path, change_fps=False, use_decord=False)
+
+        # Prefer truncating the usual +1 whisper overshoot to the real frame
+        # count so we never synthesize padded/backfilled frames for matched clips.
+        if len(video_frames) > 0 and len(whisper_chunks) > len(video_frames):
+            excess = len(whisper_chunks) - len(video_frames)
+            if excess <= 3:
+                whisper_chunks = whisper_chunks[: len(video_frames)]
 
         video_frames, faces, boxes, affine_matrices = self.loop_video(whisper_chunks, video_frames)
 

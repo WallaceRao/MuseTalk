@@ -61,6 +61,10 @@ def _load_service_config() -> ServiceConfig:
     if dilate is not None:
         config.asd_mask_dilate = max(0, int(dilate))
 
+    vad_expand = os.environ.get("MUSETALK_ASD_VAD_EXPAND_MAX_SEC")
+    if vad_expand is not None:
+        config.asd_vad_expand_max_sec = max(0.0, float(vad_expand))
+
     pre_dilate_min = os.environ.get("MUSETALK_ASD_PRE_DILATE_MIN_SEC")
     if pre_dilate_min is not None:
         config.asd_pre_dilate_min_sec = max(0.0, float(pre_dilate_min))

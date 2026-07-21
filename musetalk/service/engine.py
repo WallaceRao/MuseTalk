@@ -32,6 +32,7 @@ from musetalk.utils.active_speaker import (
     detect_shot_ids,
     dilate_speaking_mask,
     expand_speaking_mask_to_shots,
+    expand_speaking_mask_within_vad,
     prune_short_speaking_runs,
 )
 from musetalk.utils.vad_vsdlm_fusion import build_fused_speaking_mask
@@ -108,9 +109,14 @@ class ServiceConfig:
     # Drop raw speaking runs shorter than this before dilation.
     # Also applied again after dilation to remove face-drop islands.
     asd_pre_dilate_min_sec: float = 0.2
-    # Expand speaking regions by N frames on each side to reduce flicker/gaps.
+    # Legacy fallback: expand speaking by N frames each side when VAD expand
+    # is unavailable (no VAD segments / vad expand disabled).
     asd_mask_dilate: int = 8
-    # Keep dilation inside the same camera shot (no cross-cut bleed).
+    # When VAD segments are available: expand each speaking run toward its
+    # parent VAD by up to this many seconds per side. Clamped to the VAD
+    # bounds and never across shot cuts. 0 = fall back to asd_mask_dilate.
+    asd_vad_expand_max_sec: float = 3.0
+    # Keep dilation / VAD expand inside the same camera shot (no cross-cut bleed).
     asd_dilate_respect_shots: bool = True
     # After speaking detection: lipsync whole shots that contain speaking
     # long enough to pass ``lipsync_shot_min_speak_sec``.
@@ -138,7 +144,7 @@ class ServiceConfig:
     # Downscale for detection when short side exceeds this; <= threshold keeps original.
     detect_short_side: int = 720
     # Ignore faces smaller than this fraction of the full frame area (no track/ASD/lipsync).
-    min_face_area_ratio: float = 1.0 / 50.0
+    min_face_area_ratio: float = 1.0 / 100.0
     # CodeFormer: restore only MuseTalk-generated speaking-face crops.
     use_codeformer: bool = True
     codeformer_model_path: str = "./models/codeformer/codeformer.pth"
@@ -674,7 +680,7 @@ class MuseTalkEngine:
                         before_prune,
                     )
                     raw_speaking = sum(speaking_mask)
-                if cfg.asd_mask_dilate > 0:
+                if cfg.asd_vad_expand_max_sec > 0 or cfg.asd_mask_dilate > 0:
                     valid_face = [b != coord_placeholder for b in coord_list]
                     shot_ids = None
                     n_shots = 1
@@ -692,17 +698,54 @@ class MuseTalkEngine:
                             )
                             n_shots = (max(shot_ids) + 1) if shot_ids else 1
                         logger.info(
-                            "Shot cuts for mouth-activity dilate: %d shots (hist_threshold=%.2f)",
+                            "Shot cuts for speaking expand: %d shots (hist_threshold=%.2f)",
                             n_shots,
                             cfg.shot_cut_hist_threshold,
                         )
-                    speaking_mask = dilate_speaking_mask(
-                        speaking_mask,
-                        cfg.asd_mask_dilate,
-                        valid_face=valid_face,
-                        shot_ids=shot_ids,
-                    )
-                    # Drop dilate islands left by face-drop holes (e.g. 1-frame fragments).
+
+                    vad_for_expand = None
+                    if fusion_meta is not None and fusion_meta.get("vad_segments"):
+                        vad_for_expand = list(fusion_meta["vad_segments"])
+                    elif vad_segments:
+                        vad_for_expand = list(vad_segments)
+
+                    before_expand = sum(speaking_mask)
+                    if (
+                        cfg.asd_vad_expand_max_sec > 0
+                        and vad_for_expand
+                    ):
+                        speaking_mask = expand_speaking_mask_within_vad(
+                            speaking_mask,
+                            vad_for_expand,
+                            fps=fps,
+                            max_expand_sec=cfg.asd_vad_expand_max_sec,
+                            shot_ids=shot_ids,
+                            valid_face=valid_face,
+                        )
+                        logger.info(
+                            "VAD speaking expand: ±%.2fs (shot_aware=%s) → %d/%d (was %d)",
+                            cfg.asd_vad_expand_max_sec,
+                            shot_ids is not None,
+                            sum(speaking_mask),
+                            len(speaking_mask),
+                            before_expand,
+                        )
+                    elif cfg.asd_mask_dilate > 0:
+                        speaking_mask = dilate_speaking_mask(
+                            speaking_mask,
+                            cfg.asd_mask_dilate,
+                            valid_face=valid_face,
+                            shot_ids=shot_ids,
+                        )
+                        logger.info(
+                            "Frame dilate ±%d (no VAD expand) → %d/%d (was %d)",
+                            cfg.asd_mask_dilate,
+                            sum(speaking_mask),
+                            len(speaking_mask),
+                            before_expand,
+                        )
+
+                    # Drop expand islands left by face-drop holes (e.g. 1-frame fragments).
                     if cfg.asd_pre_dilate_min_sec > 0:
                         before_post = sum(speaking_mask)
                         speaking_mask = prune_short_speaking_runs(
@@ -712,7 +755,7 @@ class MuseTalkEngine:
                             shot_ids=shot_ids,
                         )
                         logger.info(
-                            "Post-dilate prune: drop runs < %.2fs → %d/%d (was %d)",
+                            "Post-expand prune: drop runs < %.2fs → %d/%d (was %d)",
                             cfg.asd_pre_dilate_min_sec,
                             sum(speaking_mask),
                             len(speaking_mask),
@@ -720,12 +763,14 @@ class MuseTalkEngine:
                         )
                 speaking_frames = sum(speaking_mask)
                 logger.info(
-                    "Speaking gate: %d/%d after dilate±%d (raw=%d, vad_fusion=%s, min_speak=%.2fs)",
+                    "Speaking gate: %d/%d after expand (raw=%d, vad_fusion=%s, "
+                    "vad_expand=%.2fs, dilate±%d, min_speak=%.2fs)",
                     speaking_frames,
                     len(speaking_mask),
-                    cfg.asd_mask_dilate,
                     raw_speaking,
                     cfg.use_vad_fusion,
+                    cfg.asd_vad_expand_max_sec,
+                    cfg.asd_mask_dilate,
                     cfg.vsdlm_min_speak_duration_sec,
                 )
             elif cfg.use_lr_asd and self.asd_detector is not None:

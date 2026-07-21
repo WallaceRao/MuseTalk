@@ -365,7 +365,7 @@ def _detect_bbox_for_frame(
     detect_short_side=720,
     prev_bbox=None,
     track_min_iou=0.15,
-    min_face_area_ratio: float = 1.0 / 50.0,
+    min_face_area_ratio: float = 1.0 / 100.0,
 ):
     """Run SCRFD (+ optional DWPose-M landmarks) on a single frame.
 
@@ -574,7 +574,7 @@ def get_landmark_and_bbox(
     detect_stride=3,
     frames=None,
     detect_short_side=720,
-    min_face_area_ratio: float = 1.0 / 50.0,
+    min_face_area_ratio: float = 1.0 / 100.0,
     return_mouth_coords: bool = False,
 ):
     """

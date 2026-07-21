@@ -357,7 +357,9 @@ class LatentSyncBackend:
                 n,
                 fps,
             )
-            synced = self._infer_clip(clip_video, clip_audio, clip_out, clip_dir)
+            synced = self._infer_clip(
+                clip_video, clip_audio, clip_out, clip_dir, fps=fps, expect_frames=n
+            )
             if not synced:
                 logger.warning(
                     "LatentSync produced no frames for run [%d, %d]; keeping originals",
@@ -366,15 +368,16 @@ class LatentSyncBackend:
                 )
                 continue
 
-            # Align lengths: take min(n, len(synced)) from the start of the run.
+            # Never write more than the source run length; drop any pad/overshoot.
             use_n = min(n, len(synced))
-            if use_n < n:
+            if len(synced) != n:
                 logger.warning(
-                    "LatentSync run [%d, %d] returned %d/%d frames",
+                    "LatentSync run [%d, %d] returned %d frames (expected %d); using %d",
                     start,
                     end,
-                    use_n,
+                    len(synced),
                     n,
+                    use_n,
                 )
             for offset in range(use_n):
                 frame = synced[offset]
@@ -390,10 +393,15 @@ class LatentSyncBackend:
         audio_path: str,
         video_out_path: str,
         temp_dir: str,
+        *,
+        fps: float = 25.0,
+        expect_frames: Optional[int] = None,
     ) -> List[np.ndarray]:
         prev_cwd = os.getcwd()
         os.chdir(self.paths.repo_root)
         try:
+            # Keep whisper chunking on the same fps as the clip we wrote.
+            video_fps = float(fps) if fps and fps > 0 else 25.0
             self.pipeline(
                 video_path=video_path,
                 audio_path=audio_path,
@@ -406,7 +414,7 @@ class LatentSyncBackend:
                 height=self.resolution,
                 mask_image_path=self.paths.mask_image,
                 temp_dir=os.path.join(temp_dir, "pipeline_tmp"),
-                video_fps=25,
+                video_fps=video_fps,
             )
         except Exception:
             logger.exception("LatentSync inference failed for %s", video_path)
@@ -417,4 +425,6 @@ class LatentSyncBackend:
         if not os.path.isfile(video_out_path):
             return []
         frames, _ = decode_video_frames(video_out_path)
+        if expect_frames is not None and len(frames) > int(expect_frames):
+            frames = frames[: int(expect_frames)]
         return frames

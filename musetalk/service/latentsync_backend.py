@@ -228,6 +228,72 @@ class LatentSyncBackend:
 
         logger.info("LatentSync 1.5 models loaded")
 
+    def _get_face_detector(self):
+        """Return the same InsightFace FaceDetector LatentSync affine uses."""
+        fd = getattr(self.pipeline, "_face_detector", None)
+        if fd is not None:
+            return fd
+        prev_cwd = os.getcwd()
+        os.chdir(self.paths.repo_root)
+        try:
+            from latentsync.utils.face_detector import FaceDetector
+
+            face_device = str(self.device) if self.device.type == "cuda" else "cuda"
+            fd = FaceDetector(device=face_device)
+            self.pipeline._face_detector = fd
+            logger.info("LatentSync FaceDetector lazy-initialized for pre-filter")
+            return fd
+        except Exception as exc:
+            logger.warning("LatentSync FaceDetector unavailable for pre-filter: %s", exc)
+            return None
+        finally:
+            os.chdir(prev_cwd)
+
+    def _filter_indices_with_faces(
+        self,
+        frame_list: List[np.ndarray],
+        infer_indices: Sequence[int],
+    ) -> List[int]:
+        """Drop frames LatentSync FaceDetector cannot align; keep timeline originals.
+
+        Uses RGB input to match lipsync_pipeline.read_video → affine_transform.
+        Filtered indices are simply omitted from runs so composite keeps the
+        source frame (no temporal jump / clip compression).
+        """
+        ordered = sorted(int(i) for i in infer_indices)
+        if not ordered:
+            return []
+
+        fd = self._get_face_detector()
+        if fd is None:
+            return ordered
+
+        kept: List[int] = []
+        dropped: List[int] = []
+        for idx in ordered:
+            if idx < 0 or idx >= len(frame_list):
+                dropped.append(idx)
+                continue
+            rgb = cv2.cvtColor(frame_list[idx], cv2.COLOR_BGR2RGB)
+            bbox, _ = fd(rgb)
+            if bbox is None:
+                dropped.append(idx)
+            else:
+                kept.append(idx)
+
+        if dropped:
+            preview = dropped[:12]
+            more = "" if len(dropped) <= 12 else f" …(+{len(dropped) - 12})"
+            logger.info(
+                "LatentSync FaceDetector pre-filter: drop %d/%d no-face "
+                "frames → keep originals %s%s",
+                len(dropped),
+                len(ordered),
+                preview,
+                more,
+            )
+        return kept
+
     def lipsync_indices(
         self,
         frame_list: List[np.ndarray],
@@ -237,16 +303,24 @@ class LatentSyncBackend:
         temp_dir: str,
     ) -> Dict[int, np.ndarray]:
         """Run LatentSync on contiguous speaking runs; return full BGR frames."""
-        runs = contiguous_runs(infer_indices)
+        faced_indices = self._filter_indices_with_faces(frame_list, infer_indices)
+        runs = contiguous_runs(faced_indices)
         if not runs:
+            if infer_indices:
+                logger.warning(
+                    "LatentSync: all %d speaking frames lack a detectable face; "
+                    "keeping originals",
+                    len(infer_indices),
+                )
             return {}
 
         fps = float(fps) if fps and fps > 0 else 25.0
         os.makedirs(temp_dir, exist_ok=True)
         out: Dict[int, np.ndarray] = {}
         logger.info(
-            "LatentSync: %d speaking frames in %d contiguous run(s)",
+            "LatentSync: %d speaking frames (%d after face filter) in %d contiguous run(s)",
             len(infer_indices),
+            len(faced_indices),
             len(runs),
         )
 

@@ -34,6 +34,13 @@ class FaceDetector:
                 get_face_store = face
         return get_face_store
 
+    def detect_primary_det_bbox(self, frame, threshold=0.5):
+        """Raw InsightFace detection bbox (xyxy) of the largest eligible face."""
+        face = self._select_primary_face(frame, threshold=threshold)
+        if face is None:
+            return None
+        return face.bbox.astype(np.int_).tolist()
+
     def detect_gender(self, frame, threshold=0.5):
         """Return ``\"male\"`` / ``\"female\"`` for the primary face, or None."""
         face = self._select_primary_face(frame, threshold=threshold)

@@ -253,12 +253,15 @@ class LatentSyncBackend:
         self,
         frame_list: List[np.ndarray],
         infer_indices: Sequence[int],
+        coord_list: Optional[Sequence] = None,
+        primary_iou_min: float = 0.3,
     ) -> List[int]:
-        """Drop frames LatentSync FaceDetector cannot align; keep timeline originals.
+        """Drop frames LatentSync cannot safely align to the MuseTalk primary.
 
         Uses RGB input to match lipsync_pipeline.read_video → affine_transform.
-        Filtered indices are simply omitted from runs so composite keeps the
-        source frame (no temporal jump / clip compression).
+        When ``coord_list`` is provided, also require the InsightFace box to
+        overlap the MuseTalk primary track (avoids lipsyncing a secondary face).
+        Filtered indices keep timeline originals (no temporal jump).
         """
         ordered = sorted(int(i) for i in infer_indices)
         if not ordered:
@@ -268,29 +271,60 @@ class LatentSyncBackend:
         if fd is None:
             return ordered
 
+        from musetalk.utils.preprocessing import _bbox_iou, coord_placeholder
+
         kept: List[int] = []
-        dropped: List[int] = []
+        dropped_noface: List[int] = []
+        dropped_mismatch: List[int] = []
+        min_iou = float(primary_iou_min) if primary_iou_min is not None else 0.0
         for idx in ordered:
             if idx < 0 or idx >= len(frame_list):
-                dropped.append(idx)
+                dropped_noface.append(idx)
                 continue
             rgb = cv2.cvtColor(frame_list[idx], cv2.COLOR_BGR2RGB)
-            bbox, _ = fd(rgb)
-            if bbox is None:
-                dropped.append(idx)
+            # Prefer raw detection bbox for IoU vs MuseTalk track.
+            if hasattr(fd, "detect_primary_det_bbox"):
+                bbox = fd.detect_primary_det_bbox(rgb)
             else:
-                kept.append(idx)
+                bbox, _ = fd(rgb)
+            if bbox is None:
+                dropped_noface.append(idx)
+                continue
+            if coord_list is not None and idx < len(coord_list) and min_iou > 0:
+                hint = coord_list[idx]
+                if hint is None or hint == coord_placeholder:
+                    dropped_mismatch.append(idx)
+                    continue
+                if _bbox_iou(bbox, hint) < min_iou:
+                    dropped_mismatch.append(idx)
+                    continue
+            kept.append(idx)
 
-        if dropped:
-            preview = dropped[:12]
-            more = "" if len(dropped) <= 12 else f" …(+{len(dropped) - 12})"
+        if dropped_noface or dropped_mismatch:
+            preview_nf = dropped_noface[:8]
+            preview_mm = dropped_mismatch[:8]
+            more_nf = (
+                ""
+                if len(dropped_noface) <= 8
+                else f" …(+{len(dropped_noface) - 8})"
+            )
+            more_mm = (
+                ""
+                if len(dropped_mismatch) <= 8
+                else f" …(+{len(dropped_mismatch) - 8})"
+            )
             logger.info(
-                "LatentSync FaceDetector pre-filter: drop %d/%d no-face "
-                "frames → keep originals %s%s",
-                len(dropped),
+                "LatentSync FaceDetector pre-filter: keep %d/%d "
+                "(no-face=%d %s%s, primary-mismatch=%d %s%s, iou_min=%.2f)",
+                len(kept),
                 len(ordered),
-                preview,
-                more,
+                len(dropped_noface),
+                preview_nf,
+                more_nf,
+                len(dropped_mismatch),
+                preview_mm,
+                more_mm,
+                min_iou,
             )
         return kept
 
@@ -301,15 +335,22 @@ class LatentSyncBackend:
         infer_indices: Sequence[int],
         fps: float,
         temp_dir: str,
+        coord_list: Optional[Sequence] = None,
+        primary_iou_min: float = 0.3,
     ) -> Dict[int, np.ndarray]:
         """Run LatentSync on contiguous speaking runs; return full BGR frames."""
-        faced_indices = self._filter_indices_with_faces(frame_list, infer_indices)
+        faced_indices = self._filter_indices_with_faces(
+            frame_list,
+            infer_indices,
+            coord_list=coord_list,
+            primary_iou_min=primary_iou_min,
+        )
         runs = contiguous_runs(faced_indices)
         if not runs:
             if infer_indices:
                 logger.warning(
-                    "LatentSync: all %d speaking frames lack a detectable face; "
-                    "keeping originals",
+                    "LatentSync: all %d speaking frames lack a matching primary "
+                    "face; keeping originals",
                     len(infer_indices),
                 )
             return {}

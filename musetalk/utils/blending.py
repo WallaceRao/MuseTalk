@@ -162,19 +162,75 @@ def blend_frames(original_bgr: np.ndarray, lipsync_bgr: np.ndarray, alpha: float
     )
     return np.clip(out, 0, 255).astype(np.uint8)
 
-    body = Image.fromarray(image[:,:,::-1])
-    face = Image.fromarray(face[:,:,::-1])
 
-    x, y, x1, y1 = face_box
-    x_s, y_s, x_e, y_e = crop_box
-    face_large = body.crop(crop_box)
+def paste_lipsync_in_bbox(
+    original_bgr: np.ndarray,
+    lipsync_bgr: np.ndarray,
+    bbox,
+    *,
+    expand_ratio: float = 0.35,
+    feather_ratio: float = 0.2,
+    alpha: float = 1.0,
+) -> np.ndarray:
+    """Paste LatentSync result only inside an expanded primary-face bbox.
 
-    mask_image = Image.fromarray(mask_array)
-    mask_image = mask_image.convert("L")
-    face_large.paste(face, (x-x_s, y-y_s, x1-x_s, y1-y_s))
-    body.paste(face_large, crop_box[:2], mask_image)
-    body = np.array(body)
-    return body[:,:,::-1]
+    LatentSync picks the largest InsightFace box per frame and can briefly
+    rewrite a secondary person. Restricting the composite to the MuseTalk
+    tracked primary bbox keeps other faces on the original plate.
+    """
+    if bbox is None or len(bbox) < 4:
+        return blend_frames(original_bgr, lipsync_bgr, alpha)
+
+    h, w = original_bgr.shape[:2]
+    if lipsync_bgr.shape[0] != h or lipsync_bgr.shape[1] != w:
+        lipsync_bgr = cv2.resize(lipsync_bgr, (w, h), interpolation=cv2.INTER_LANCZOS4)
+
+    x1, y1, x2, y2 = [float(v) for v in bbox[:4]]
+    if x2 <= x1 or y2 <= y1:
+        return blend_frames(original_bgr, lipsync_bgr, alpha)
+
+    bw, bh = x2 - x1, y2 - y1
+    pad_x = bw * float(expand_ratio)
+    pad_y = bh * float(expand_ratio)
+    x1e = max(0, int(np.floor(x1 - pad_x)))
+    y1e = max(0, int(np.floor(y1 - pad_y)))
+    x2e = min(w, int(np.ceil(x2 + pad_x)))
+    y2e = min(h, int(np.ceil(y2 + pad_y)))
+    if x2e <= x1e or y2e <= y1e:
+        return original_bgr.copy()
+
+    rw, rh = x2e - x1e, y2e - y1e
+    mask = np.zeros((rh, rw), dtype=np.float32)
+    feather = max(1, int(round(min(rw, rh) * float(feather_ratio))))
+    # Soft ellipse covering the expanded face box.
+    cv2.ellipse(
+        mask,
+        (rw // 2, rh // 2),
+        (max(1, rw // 2 - 1), max(1, rh // 2 - 1)),
+        0,
+        0,
+        360,
+        1.0,
+        -1,
+    )
+    if feather > 0:
+        k = feather * 2 + 1
+        mask = cv2.GaussianBlur(mask, (k, k), 0)
+        peak = float(mask.max()) if mask.size else 0.0
+        if peak > 1e-6:
+            mask /= peak
+
+    a = float(np.clip(alpha, 0.0, 1.0))
+    if a < 0.999:
+        mask = mask * a
+
+    region_o = original_bgr[y1e:y2e, x1e:x2e].astype(np.float32)
+    region_s = lipsync_bgr[y1e:y2e, x1e:x2e].astype(np.float32)
+    m = mask[..., None]
+    blended = region_s * m + region_o * (1.0 - m)
+    out = original_bgr.copy()
+    out[y1e:y2e, x1e:x2e] = np.clip(blended, 0, 255).astype(np.uint8)
+    return out
 
 
 def get_image_prepare_material(image, face_box, upper_boundary_ratio=0.5, expand=1.5, fp=None, mode="raw"):

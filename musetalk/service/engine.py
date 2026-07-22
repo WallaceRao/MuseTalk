@@ -43,6 +43,7 @@ from musetalk.utils.blending import (
     compute_segment_blend_alphas,
     get_image,
     match_face_color_lab,
+    paste_lipsync_in_bbox,
 )
 from musetalk.utils.face_parsing import FaceParsing
 from musetalk.utils.preprocessing import (
@@ -176,6 +177,12 @@ class ServiceConfig:
     latentsync_guidance_scale: float = 1.0
     latentsync_enable_deepcache: bool = True
     latentsync_seed: int = 1247
+    # Drop LatentSync frames whose InsightFace box does not match MuseTalk primary.
+    latentsync_primary_iou_min: float = 0.3
+    # Composite only inside primary bbox so secondary faces never flash.
+    latentsync_paste_primary_only: bool = True
+    latentsync_paste_expand_ratio: float = 0.35
+    latentsync_paste_feather_ratio: float = 0.2
 
 
 class MuseTalkEngine:
@@ -1043,6 +1050,8 @@ class MuseTalkEngine:
                     infer_indices=infer_indices,
                     fps=float(fps),
                     temp_dir=os.path.join(temp_dir, "latentsync"),
+                    coord_list=coord_list,
+                    primary_iou_min=cfg.latentsync_primary_iou_min,
                 )
             elif infer_indices:
                 logger.info(
@@ -1099,18 +1108,19 @@ class MuseTalkEngine:
             height, width = frame_list[0].shape[:2]
             temp_vid_path = os.path.join(temp_dir, f"temp_{output_basename}.mp4")
 
-            # LatentSync already pastes lips onto full frames; composite is a
-            # full-frame replace with optional edge blend. MuseTalk keeps the
-            # face-crop + CodeFormer + parsing blend path.
+            # LatentSync re-detects the largest face per frame; paste only the
+            # MuseTalk primary bbox so secondary faces never flash.
             if self._use_latentsync:
                 active_mask = [i in full_frame_by_index for i in range(video_num)]
                 blend_alphas = compute_segment_blend_alphas(
                     active_mask, ramp_frames=cfg.blend_ramp_frames
                 )
-                if cfg.blend_ramp_frames > 0:
+                if cfg.blend_ramp_frames > 0 or cfg.latentsync_paste_primary_only:
                     logger.info(
-                        "LatentSync composite: blend_ramp_frames=%d, synced=%d/%d",
+                        "LatentSync composite: blend_ramp_frames=%d, "
+                        "primary_paste=%s, synced=%d/%d",
                         cfg.blend_ramp_frames,
+                        cfg.latentsync_paste_primary_only,
                         len(full_frame_by_index),
                         video_num,
                     )
@@ -1137,7 +1147,27 @@ class MuseTalkEngine:
                             combine_frame = cv2.resize(
                                 combine_frame, (width, height), interpolation=cv2.INTER_LANCZOS4
                             )
-                        if alpha < 0.999:
+                        bbox = coord_list[i] if i < len(coord_list) else None
+                        if (
+                            cfg.latentsync_paste_primary_only
+                            and bbox is not None
+                            and bbox != coord_placeholder
+                        ):
+                            paste_bbox = list(bbox)
+                            if cfg.version == "v15":
+                                paste_bbox[3] = min(
+                                    float(paste_bbox[3]) + cfg.extra_margin,
+                                    float(height),
+                                )
+                            combine_frame = paste_lipsync_in_bbox(
+                                ori_frame,
+                                combine_frame,
+                                paste_bbox,
+                                expand_ratio=cfg.latentsync_paste_expand_ratio,
+                                feather_ratio=cfg.latentsync_paste_feather_ratio,
+                                alpha=alpha,
+                            )
+                        elif alpha < 0.999:
                             combine_frame = blend_frames(ori_frame, combine_frame, alpha)
                         lipsync_frames += 1
                         writer.write(combine_frame)

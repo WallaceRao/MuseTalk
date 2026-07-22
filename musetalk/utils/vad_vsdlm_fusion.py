@@ -27,7 +27,7 @@ from musetalk.utils.preprocessing import (
     _resize_for_detection,
     coord_placeholder,
 )
-from musetalk.utils.vad_client import VadSegment, detect_voice_segments
+from musetalk.utils.vad_client import VadSegment, detect_voice_segments, vad_span
 
 logger = logging.getLogger("musetalk_service")
 
@@ -572,11 +572,12 @@ def fuse_vad_with_vsdlm(
     if not vad_segments:
         return []
     if not visual_intervals:
-        return [(s, e, -1) for s, e in vad_segments]
+        return [(*vad_span(seg), -1) for seg in vad_segments]
 
     max_gap = max(0.0, float(max_assign_gap_sec))
     assigned: List[AssignedSegment] = []
-    for vad_start, vad_end in vad_segments:
+    for seg in vad_segments:
+        vad_start, vad_end = vad_span(seg)
         overlapping = _speakers_overlapping(visual_intervals, vad_start, vad_end)
         if len(overlapping) <= 1:
             if overlapping:
@@ -680,7 +681,7 @@ def build_fused_speaking_mask(
     *,
     fps: float,
     vad_url: str | None = None,
-    vad_segments: Sequence[Tuple[float, float]] | None = None,
+    vad_segments: Sequence[VadSegment] | None = None,
     detect_short_side: int = 720,
     min_face_area_ratio: float = 1.0 / 100.0,
     detect_stride: int = 3,

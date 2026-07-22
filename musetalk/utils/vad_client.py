@@ -5,13 +5,49 @@ from __future__ import annotations
 import json
 import logging
 import os
-from typing import List, Optional, Sequence, Tuple, Union
+from typing import List, NamedTuple, Optional, Sequence, Tuple, Union
 
 import requests
 
 logger = logging.getLogger("musetalk_service")
 
-VadSegment = Tuple[float, float]
+
+class VadSegment(NamedTuple):
+    start: float
+    end: float
+    gender: Optional[str] = None
+
+
+def normalize_gender(value) -> Optional[str]:
+    """Return ``male`` / ``female`` or None when gender is missing/unclear."""
+    if value is None:
+        return None
+    text = str(value).strip().lower()
+    if text in ("male", "female"):
+        return text
+    return None
+
+
+def vad_span(seg) -> Tuple[float, float]:
+    """Extract (start, end) from VadSegment or legacy (start, end) tuples."""
+    if isinstance(seg, VadSegment):
+        return float(seg.start), float(seg.end)
+    if hasattr(seg, "start") and hasattr(seg, "end"):
+        return float(seg.start), float(seg.end)
+    return float(seg[0]), float(seg[1])
+
+
+def vad_gender(seg) -> Optional[str]:
+    """Extract normalized gender from a VAD segment if present."""
+    if isinstance(seg, VadSegment):
+        return normalize_gender(seg.gender)
+    if hasattr(seg, "gender"):
+        return normalize_gender(getattr(seg, "gender"))
+    if isinstance(seg, dict):
+        return normalize_gender(seg.get("gender"))
+    if isinstance(seg, (list, tuple)) and len(seg) >= 3:
+        return normalize_gender(seg[2])
+    return None
 
 
 def normalize_vad_segments(
@@ -19,10 +55,11 @@ def normalize_vad_segments(
     *,
     strict: bool = True,
 ) -> List[VadSegment]:
-    """Normalize raw segment items to ``[(start_sec, end_sec), ...]``."""
+    """Normalize raw segment items to ``VadSegment(start, end, gender?)``."""
     out: List[VadSegment] = []
     for seg in segments:
         try:
+            gender = None
             if isinstance(seg, dict):
                 if "start" not in seg or "end" not in seg:
                     raise ValueError(
@@ -30,19 +67,25 @@ def normalize_vad_segments(
                     )
                 start = float(seg["start"])
                 end = float(seg["end"])
+                gender = normalize_gender(seg.get("gender"))
+            elif isinstance(seg, VadSegment):
+                start, end = float(seg.start), float(seg.end)
+                gender = normalize_gender(seg.gender)
             elif isinstance(seg, (list, tuple)) and len(seg) >= 2:
                 start, end = float(seg[0]), float(seg[1])
+                if len(seg) >= 3:
+                    gender = normalize_gender(seg[2])
             else:
                 raise ValueError(
-                    "Each VAD segment must be {start,end} or [start,end]"
+                    "Each VAD segment must be {start,end[,gender]} or [start,end]"
                 )
         except (TypeError, ValueError, KeyError):
             if strict:
                 raise
             continue
         if end > start:
-            out.append((start, end))
-    out.sort(key=lambda x: x[0])
+            out.append(VadSegment(start, end, gender))
+    out.sort(key=lambda x: x.start)
     return out
 
 
@@ -84,11 +127,12 @@ def clip_vad_segments_to_window(
     if t1 <= t0:
         return []
     out: List[VadSegment] = []
-    for start, end in segments:
+    for seg in segments:
+        start, end = vad_span(seg)
         a = max(float(start), t0)
         b = min(float(end), t1)
         if b > a:
-            out.append((a - t0, b - t0))
+            out.append(VadSegment(a - t0, b - t0, vad_gender(seg)))
     return out
 
 
@@ -106,9 +150,11 @@ def detect_voice_segments(
     """
     if vad_segments is not None:
         out = normalize_vad_segments(list(vad_segments), strict=True)
+        n_gender = sum(1 for s in out if s.gender is not None)
         logger.info(
-            "VAD (client-provided): %d voice segments (skip remote detect)",
+            "VAD (client-provided): %d voice segments (%d with gender, skip remote detect)",
             len(out),
+            n_gender,
         )
         return out
 
@@ -126,7 +172,14 @@ def detect_voice_segments(
     payload = response.json()
     segments = payload.get("voice_segments") or []
     out = normalize_vad_segments(segments, strict=False)
-    logger.info("VAD (%s): %d voice segments from %s", url, len(out), audio_path)
+    n_gender = sum(1 for s in out if s.gender is not None)
+    logger.info(
+        "VAD (%s): %d voice segments (%d with gender) from %s",
+        url,
+        len(out),
+        n_gender,
+        audio_path,
+    )
     return out
 
 
@@ -138,7 +191,8 @@ def segments_to_frame_mask(
     """Convert time segments to a per-frame boolean mask."""
     fps = float(fps) if fps and fps > 0 else 25.0
     mask = [False] * n_frames
-    for start, end in segments:
+    for seg in segments:
+        start, end = vad_span(seg)
         i0 = max(0, int(start * fps))
         i1 = min(n_frames, int(round(end * fps)))
         for i in range(i0, i1):

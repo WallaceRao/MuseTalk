@@ -8,37 +8,60 @@ INSIGHTFACE_DETECT_SIZE = 512
 class FaceDetector:
     def __init__(self, device="cuda"):
         self.app = FaceAnalysis(
-            allowed_modules=["detection", "landmark_2d_106"],
+            allowed_modules=["detection", "landmark_2d_106", "genderage"],
             root="checkpoints/auxiliary",
             providers=["CUDAExecutionProvider"],
         )
         self.app.prepare(ctx_id=cuda_to_int(device), det_size=(INSIGHTFACE_DETECT_SIZE, INSIGHTFACE_DETECT_SIZE))
 
+    def _select_primary_face(self, frame, threshold=0.5):
+        """Return the largest eligible InsightFace face, or None."""
+        faces = self.app.get(frame)
+        get_face_store = None
+        max_size = 0
+        for face in faces:
+            bbox = face.bbox.astype(np.int_).tolist()
+            w, h = bbox[2] - bbox[0], bbox[3] - bbox[1]
+            if w < 50 or h < 80:
+                continue
+            if w / h > 1.5 or w / h < 0.2:
+                continue
+            if face.det_score < threshold:
+                continue
+            size_now = w * h
+            if size_now > max_size:
+                max_size = size_now
+                get_face_store = face
+        return get_face_store
+
+    def detect_gender(self, frame, threshold=0.5):
+        """Return ``\"male\"`` / ``\"female\"`` for the primary face, or None."""
+        face = self._select_primary_face(frame, threshold=threshold)
+        if face is None:
+            return None
+        # InsightFace genderage: 0 = female, 1 = male.
+        gender = getattr(face, "gender", None)
+        if gender is None:
+            sex = getattr(face, "sex", None)
+            if sex in ("M", "m"):
+                return "male"
+            if sex in ("F", "f"):
+                return "female"
+            return None
+        try:
+            g = int(gender)
+        except (TypeError, ValueError):
+            return None
+        if g == 1:
+            return "male"
+        if g == 0:
+            return "female"
+        return None
+
     def __call__(self, frame, threshold=0.5):
         f_h, f_w, _ = frame.shape
 
-        faces = self.app.get(frame)
-
-        get_face_store = None
-        max_size = 0
-
-        if len(faces) == 0:
-            return None, None
-        else:
-            for face in faces:
-                bbox = face.bbox.astype(np.int_).tolist()
-                w, h = bbox[2] - bbox[0], bbox[3] - bbox[1]
-                if w < 50 or h < 80:
-                    continue
-                if w / h > 1.5 or w / h < 0.2:
-                    continue
-                if face.det_score < threshold:
-                    continue
-                size_now = w * h
-
-                if size_now > max_size:
-                    max_size = size_now
-                    get_face_store = face
+        get_face_store = self._select_primary_face(frame, threshold=threshold)
 
         if get_face_store is None:
             return None, None

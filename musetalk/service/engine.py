@@ -3,6 +3,7 @@ import logging
 import os
 import shutil
 import subprocess
+import sys
 import tempfile
 from dataclasses import dataclass
 from typing import List, Optional, Tuple
@@ -50,6 +51,7 @@ from musetalk.utils.preprocessing import (
     get_landmark_and_bbox,
 )
 from musetalk.utils.utils import datagen, get_file_type, load_all_model
+from musetalk.utils.vad_client import VadSegment
 
 from musetalk.service.ffmpeg_env import ensure_ffmpeg_env, ensure_ffmpeg_ready
 
@@ -184,6 +186,7 @@ class MuseTalkEngine:
         )
         self._ensure_ffmpeg()
         self._load_models()
+        self._gender_face_detector = None
 
     def _ensure_ffmpeg(self) -> None:
         try:
@@ -199,6 +202,38 @@ class MuseTalkEngine:
             "ls",
             "v2",
         }
+
+    def _get_gender_face_detector(self):
+        """InsightFace FaceDetector with genderage (same as LatentSync affine)."""
+        if self.latentsync is not None:
+            try:
+                return self.latentsync._get_face_detector()
+            except Exception as exc:
+                logger.warning("LatentSync FaceDetector for gender gate failed: %s", exc)
+
+        if self._gender_face_detector is not None:
+            return self._gender_face_detector
+
+        repo_root = os.path.abspath(self.config.latentsync_repo)
+        if not os.path.isdir(repo_root):
+            logger.warning("LatentSync repo missing; gender gate disabled")
+            return None
+        prev_cwd = os.getcwd()
+        if repo_root not in sys.path:
+            sys.path.insert(0, repo_root)
+        os.chdir(repo_root)
+        try:
+            from latentsync.utils.face_detector import FaceDetector
+
+            face_device = str(self.device) if self.device.type == "cuda" else "cuda"
+            self._gender_face_detector = FaceDetector(device=face_device)
+            logger.info("InsightFace FaceDetector loaded for gender gate")
+            return self._gender_face_detector
+        except Exception as exc:
+            logger.warning("Gender FaceDetector unavailable: %s", exc)
+            return None
+        finally:
+            os.chdir(prev_cwd)
 
     def _load_models(self) -> None:
         cfg = self.config
@@ -328,7 +363,7 @@ class MuseTalkEngine:
         *,
         force_chunk: bool = False,
         chunk_duration_sec: Optional[float] = None,
-        vad_segments: Optional[List[Tuple[float, float]]] = None,
+        vad_segments: Optional[List[VadSegment]] = None,
     ) -> dict:
         video_path = os.path.abspath(video_path)
         audio_path = os.path.abspath(audio_path)
@@ -383,7 +418,7 @@ class MuseTalkEngine:
         output_path: str,
         chunk_duration_sec: float,
         *,
-        vad_segments: Optional[List[Tuple[float, float]]] = None,
+        vad_segments: Optional[List[VadSegment]] = None,
     ) -> dict:
         from musetalk.utils.vad_client import clip_vad_segments_to_window
 
@@ -498,7 +533,7 @@ class MuseTalkEngine:
         audio_mux_source: Optional[str] = None,
         preloaded_frames: Optional[List[np.ndarray]] = None,
         preloaded_fps: Optional[float] = None,
-        vad_segments: Optional[List[Tuple[float, float]]] = None,
+        vad_segments: Optional[List[VadSegment]] = None,
     ) -> dict:
         video_path = os.path.abspath(video_path)
         audio_path = os.path.abspath(audio_path)
@@ -680,6 +715,60 @@ class MuseTalkEngine:
                         before_prune,
                     )
                     raw_speaking = sum(speaking_mask)
+
+                # Gender gate on pre-dilate speaking runs (before VAD expand/dilate).
+                vad_for_gender = None
+                if fusion_meta is not None and fusion_meta.get("vad_segments"):
+                    vad_for_gender = list(fusion_meta["vad_segments"])
+                elif vad_segments:
+                    vad_for_gender = list(vad_segments)
+                if vad_for_gender:
+                    from musetalk.utils.gender_gate import (
+                        filter_speaking_mask_by_vad_gender,
+                    )
+                    from musetalk.utils.vad_client import vad_gender
+
+                    if any(vad_gender(seg) is not None for seg in vad_for_gender):
+                        gender_shot_ids = None
+                        if cfg.asd_dilate_respect_shots:
+                            if (
+                                fusion_meta is not None
+                                and fusion_meta.get("shot_ids") is not None
+                            ):
+                                gender_shot_ids = list(fusion_meta["shot_ids"])[
+                                    :video_num
+                                ]
+                            else:
+                                gender_shot_ids = detect_shot_ids(
+                                    frame_list[:video_num],
+                                    hist_threshold=cfg.shot_cut_hist_threshold,
+                                )
+                        face_det = self._get_gender_face_detector()
+                        if face_det is not None:
+                            before_gender = sum(speaking_mask)
+                            speaking_mask, gender_meta = (
+                                filter_speaking_mask_by_vad_gender(
+                                    speaking_mask,
+                                    frame_list[:video_num],
+                                    vad_for_gender,
+                                    face_det,
+                                    fps=fps,
+                                    shot_ids=gender_shot_ids,
+                                )
+                            )
+                            raw_speaking = sum(speaking_mask)
+                            if gender_meta.get("dropped_runs"):
+                                logger.info(
+                                    "Gender gate applied: %d → %d speaking frames",
+                                    before_gender,
+                                    raw_speaking,
+                                )
+                        else:
+                            logger.warning(
+                                "VAD gender present but FaceDetector unavailable; "
+                                "skipping gender gate"
+                            )
+
                 if cfg.asd_vad_expand_max_sec > 0 or cfg.asd_mask_dilate > 0:
                     valid_face = [b != coord_placeholder for b in coord_list]
                     shot_ids = None

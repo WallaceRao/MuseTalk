@@ -10,6 +10,7 @@ import torch
 from scipy.io import wavfile
 
 from musetalk.utils.preprocessing import coord_placeholder
+from musetalk.utils.vad_client import vad_span
 
 LR_ASD_ROOT = os.path.abspath(
     os.path.join(os.path.dirname(__file__), "../../third_party/LR-ASD")
@@ -1031,7 +1032,7 @@ def _shot_ranges(
 def _vad_frame_bounds_for_run(
     run_start: int,
     run_end: int,
-    vad_segments: Sequence[Tuple[float, float]],
+    vad_segments: Sequence,
     *,
     fps: float,
     n_frames: int,
@@ -1046,8 +1047,8 @@ def _vad_frame_bounds_for_run(
     t1 = (run_end + 1) / fps
     best: Optional[Tuple[float, float]] = None
     best_overlap = 0.0
-    for vs, ve in vad_segments:
-        vs_f, ve_f = float(vs), float(ve)
+    for seg in vad_segments:
+        vs_f, ve_f = vad_span(seg)
         if ve_f <= vs_f:
             continue
         o0, o1 = max(t0, vs_f), min(t1, ve_f)
@@ -1070,7 +1071,7 @@ def _vad_frame_bounds_for_run(
 
 def expand_speaking_mask_within_vad(
     speaking_mask: Sequence[bool],
-    vad_segments: Sequence[Tuple[float, float]],
+    vad_segments: Sequence,
     *,
     fps: float,
     max_expand_sec: float = 3.0,

@@ -173,8 +173,8 @@ class ServiceConfig:
     latentsync_ckpt: str = "./models/latentsync15/latentsync_unet.pt"
     latentsync_whisper: str = "./models/latentsync15/whisper/tiny.pt"
     latentsync_vae: str = "./models/sd-vae"
-    latentsync_inference_steps: int = 18
-    latentsync_guidance_scale: float = 1.0
+    latentsync_inference_steps: int = 25
+    latentsync_guidance_scale: float = 1.5
     latentsync_enable_deepcache: bool = True
     latentsync_seed: int = 1247
     # Drop LatentSync frames whose InsightFace box does not match MuseTalk primary.

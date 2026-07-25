@@ -179,6 +179,10 @@ class ServiceConfig:
     latentsync_seed: int = 1247
     # Drop LatentSync frames whose InsightFace box does not match MuseTalk primary.
     latentsync_primary_iou_min: float = 0.3
+    # Visual gender gate: FairFace ONNX (low conf → unclear, keep speaking frames).
+    fairface_model_path: str = "./models/fairface/fairface.onnx"
+    fairface_scrfd_path: str = "./models/scrfd/det_10g.onnx"
+    gender_min_confidence: float = 0.75
     # Composite only inside primary bbox so secondary faces never flash.
     latentsync_paste_primary_only: bool = True
     latentsync_paste_expand_ratio: float = 0.35
@@ -211,36 +215,46 @@ class MuseTalkEngine:
         }
 
     def _get_gender_face_detector(self):
-        """InsightFace FaceDetector with genderage (same as LatentSync affine)."""
-        if self.latentsync is not None:
-            try:
-                return self.latentsync._get_face_detector()
-            except Exception as exc:
-                logger.warning("LatentSync FaceDetector for gender gate failed: %s", exc)
-
+        """FairFace ONNX gender detector for the speaking-mask gender gate."""
         if self._gender_face_detector is not None:
             return self._gender_face_detector
 
-        repo_root = os.path.abspath(self.config.latentsync_repo)
-        if not os.path.isdir(repo_root):
-            logger.warning("LatentSync repo missing; gender gate disabled")
+        cfg = self.config
+        model_path = os.path.abspath(cfg.fairface_model_path)
+        scrfd_path = os.path.abspath(cfg.fairface_scrfd_path)
+        if not os.path.isfile(model_path):
+            logger.warning(
+                "FairFace ONNX missing (%s); gender gate disabled", model_path
+            )
             return None
-        prev_cwd = os.getcwd()
-        if repo_root not in sys.path:
-            sys.path.insert(0, repo_root)
-        os.chdir(repo_root)
-        try:
-            from latentsync.utils.face_detector import FaceDetector
+        if not os.path.isfile(scrfd_path):
+            logger.warning(
+                "SCRFD model missing for FairFace (%s); gender gate disabled",
+                scrfd_path,
+            )
+            return None
 
-            face_device = str(self.device) if self.device.type == "cuda" else "cuda"
-            self._gender_face_detector = FaceDetector(device=face_device)
-            logger.info("InsightFace FaceDetector loaded for gender gate")
+        try:
+            from musetalk.utils.fairface_gender import FairFaceGenderDetector
+
+            providers = None
+            if self.device.type == "cuda":
+                providers = ["CUDAExecutionProvider", "CPUExecutionProvider"]
+            self._gender_face_detector = FairFaceGenderDetector(
+                model_path,
+                scrfd_model_path=scrfd_path,
+                min_confidence=float(cfg.gender_min_confidence),
+                providers=providers,
+            )
+            logger.info(
+                "FairFace gender detector loaded for gender gate "
+                "(min_conf=%.2f)",
+                float(cfg.gender_min_confidence),
+            )
             return self._gender_face_detector
         except Exception as exc:
-            logger.warning("Gender FaceDetector unavailable: %s", exc)
+            logger.warning("FairFace gender detector unavailable: %s", exc)
             return None
-        finally:
-            os.chdir(prev_cwd)
 
     def _load_models(self) -> None:
         cfg = self.config
@@ -761,6 +775,9 @@ class MuseTalkEngine:
                                     face_det,
                                     fps=fps,
                                     shot_ids=gender_shot_ids,
+                                    min_confidence=float(
+                                        cfg.gender_min_confidence
+                                    ),
                                 )
                             )
                             raw_speaking = sum(speaking_mask)
@@ -772,7 +789,7 @@ class MuseTalkEngine:
                                 )
                         else:
                             logger.warning(
-                                "VAD gender present but FaceDetector unavailable; "
+                                "VAD gender present but FairFace unavailable; "
                                 "skipping gender gate"
                             )
 

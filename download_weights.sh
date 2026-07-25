@@ -4,7 +4,7 @@
 CheckpointsDir="models"
 
 # Create necessary directories
-mkdir -p models/musetalk models/musetalkV15 models/syncnet models/dwpose models/face-parse-bisent models/sd-vae models/whisper
+mkdir -p models/musetalk models/musetalkV15 models/syncnet models/dwpose models/face-parse-bisent models/sd-vae models/whisper models/fairface
 
 # Install required packages
 pip install -U "huggingface_hub[cli]"
@@ -47,5 +47,9 @@ huggingface-cli download ByteDance/LatentSync \
 gdown --id 154JgKpzCPW82qINcVieuPH3fZ2e0P812 -O $CheckpointsDir/face-parse-bisent/79999_iter.pth
 curl -L https://download.pytorch.org/models/resnet18-5c106cde.pth \
   -o $CheckpointsDir/face-parse-bisent/resnet18-5c106cde.pth
+
+# FairFace ONNX for gender gate (SCRFD crop + gender softmax)
+curl -L https://github.com/yakhyo/fairface-onnx/releases/download/weights/fairface.onnx \
+  -o $CheckpointsDir/fairface/fairface.onnx
 
 echo "✅ All weights have been downloaded successfully!" 

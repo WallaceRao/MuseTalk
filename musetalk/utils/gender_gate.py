@@ -5,7 +5,6 @@ from __future__ import annotations
 import logging
 from typing import List, Optional, Sequence, Tuple
 
-import cv2
 import numpy as np
 
 from musetalk.utils.vad_client import normalize_gender, vad_gender, vad_span
@@ -62,22 +61,43 @@ def visual_gender_for_run(
     face_detector,
     *,
     max_samples: int = 8,
+    min_confidence: float | None = None,
 ) -> Optional[str]:
-    """Majority-vote visual gender for a speaking run; None if unclear."""
+    """Majority-vote visual gender for a speaking run; None if unclear.
+
+    Low-confidence detections (below ``min_confidence``, or the detector's own
+    threshold when using ``detect_gender``) are ignored. If there are no
+    confident votes, returns ``None`` so the gender gate keeps the run.
+    """
     if face_detector is None:
         return None
+
+    detect_with_conf = getattr(face_detector, "detect_gender_with_confidence", None)
     detect_gender = getattr(face_detector, "detect_gender", None)
-    if detect_gender is None:
+    if detect_with_conf is None and detect_gender is None:
         return None
+
+    if min_confidence is None:
+        min_confidence = float(getattr(face_detector, "min_confidence", 0.0) or 0.0)
 
     votes = {"male": 0, "female": 0}
     for idx in _sample_frame_indices(run_start, run_end, max_samples=max_samples):
         if idx < 0 or idx >= len(frame_list):
             continue
-        rgb = cv2.cvtColor(frame_list[idx], cv2.COLOR_BGR2RGB)
-        g = normalize_gender(detect_gender(rgb))
-        if g in votes:
+        # Native video frames are BGR.
+        frame = frame_list[idx]
+        if detect_with_conf is not None:
+            label, conf = detect_with_conf(frame)
+            g = normalize_gender(label)
+            if g not in votes:
+                continue
+            if conf is None or float(conf) < float(min_confidence):
+                continue
             votes[g] += 1
+        else:
+            g = normalize_gender(detect_gender(frame))
+            if g in votes:
+                votes[g] += 1
 
     if votes["male"] == 0 and votes["female"] == 0:
         return None
@@ -126,11 +146,12 @@ def filter_speaking_mask_by_vad_gender(
     fps: float,
     shot_ids: Sequence[int] | None = None,
     max_samples: int = 8,
+    min_confidence: float | None = None,
 ) -> Tuple[List[bool], dict]:
     """Drop pre-dilate speaking runs whose visual gender conflicts with VAD.
 
-    Unclear VAD gender, unclear visual gender, or missing detector → keep run.
-    Only definite male/female mismatches are zeroed out.
+    Unclear VAD gender, unclear/low-confidence visual gender, or missing
+    detector → keep run. Only definite male/female mismatches are zeroed out.
     """
     out = list(speaking_mask)
     meta = {
@@ -141,6 +162,11 @@ def filter_speaking_mask_by_vad_gender(
         "pass_unclear": 0,
         "pass_match": 0,
         "mismatches": [],
+        "min_confidence": (
+            float(min_confidence)
+            if min_confidence is not None
+            else float(getattr(face_detector, "min_confidence", 0.0) or 0.0)
+        ),
     }
     if not out or not vad_segments or face_detector is None:
         return out, meta
@@ -158,7 +184,12 @@ def filter_speaking_mask_by_vad_gender(
             meta["pass_unclear"] += 1
             continue
         vis_g = visual_gender_for_run(
-            frame_list, rs, re, face_detector, max_samples=max_samples
+            frame_list,
+            rs,
+            re,
+            face_detector,
+            max_samples=max_samples,
+            min_confidence=meta["min_confidence"],
         )
         if vis_g is None:
             meta["pass_unclear"] += 1
@@ -185,21 +216,23 @@ def filter_speaking_mask_by_vad_gender(
         )
         logger.info(
             "Gender gate: drop %d runs / %d frames "
-            "(checked=%d, match=%d, unclear=%d) mismatches=%s%s",
+            "(checked=%d, match=%d, unclear=%d, min_conf=%.2f) mismatches=%s%s",
             meta["dropped_runs"],
             meta["dropped_frames"],
             meta["checked_runs"],
             meta["pass_match"],
             meta["pass_unclear"],
+            meta["min_confidence"],
             preview,
             more,
         )
     else:
         logger.info(
             "Gender gate: no mismatches "
-            "(checked=%d, match=%d, unclear=%d)",
+            "(checked=%d, match=%d, unclear=%d, min_conf=%.2f)",
             meta["checked_runs"],
             meta["pass_match"],
             meta["pass_unclear"],
+            meta["min_confidence"],
         )
     return out, meta

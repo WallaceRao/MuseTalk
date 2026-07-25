@@ -1,8 +1,17 @@
 from insightface.app import FaceAnalysis
+import cv2
 import numpy as np
 import torch
+from insightface.utils import face_align
 
 INSIGHTFACE_DETECT_SIZE = 512
+
+
+def _softmax2(logits):
+    x = np.asarray(logits, dtype=np.float64)
+    x = x - np.max(x)
+    e = np.exp(x)
+    return e / np.maximum(e.sum(), 1e-12)
 
 
 class FaceDetector:
@@ -13,6 +22,50 @@ class FaceDetector:
             providers=["CUDAExecutionProvider"],
         )
         self.app.prepare(ctx_id=cuda_to_int(device), det_size=(INSIGHTFACE_DETECT_SIZE, INSIGHTFACE_DETECT_SIZE))
+        self._patch_genderage_scores()
+
+    def _patch_genderage_scores(self):
+        """Attach gender softmax scores onto each Face during genderage inference.
+
+        Upstream InsightFace only stores ``argmax(pred[:2])``; we keep that
+        behavior and additionally set ``gender_scores`` / ``gender_confidence``.
+        """
+        models = getattr(self.app, "models", None)
+        if not models or "genderage" not in models:
+            return
+        ga = models["genderage"]
+        if getattr(ga, "_musetalk_scores_patched", False):
+            return
+
+        def get_with_scores(img, face):
+            bbox = face.bbox
+            w, h = (bbox[2] - bbox[0]), (bbox[3] - bbox[1])
+            center = (bbox[2] + bbox[0]) / 2, (bbox[3] + bbox[1]) / 2
+            _scale = ga.input_size[0] / (max(w, h) * 1.5)
+            aimg, _M = face_align.transform(img, center, ga.input_size[0], _scale, 0)
+            input_size = tuple(aimg.shape[0:2][::-1])
+            blob = cv2.dnn.blobFromImage(
+                aimg,
+                1.0 / ga.input_std,
+                input_size,
+                (ga.input_mean, ga.input_mean, ga.input_mean),
+                swapRB=True,
+            )
+            pred = ga.session.run(ga.output_names, {ga.input_name: blob})[0][0]
+            if ga.taskname == "genderage":
+                assert len(pred) == 3
+                scores = _softmax2(pred[:2])
+                gender = int(np.argmax(scores))
+                age = int(np.round(pred[2] * 100))
+                face["gender"] = gender
+                face["age"] = age
+                face["gender_scores"] = scores.astype(np.float32)  # [female, male]
+                face["gender_confidence"] = float(scores[gender])
+                return gender, age
+            return pred
+
+        ga.get = get_with_scores
+        ga._musetalk_scores_patched = True
 
     def _select_primary_face(self, frame, threshold=0.5):
         """Return the largest eligible InsightFace face, or None."""
@@ -41,9 +94,9 @@ class FaceDetector:
             return None
         return face.bbox.astype(np.int_).tolist()
 
-    def detect_gender(self, frame, threshold=0.5):
-        """Return ``\"male\"`` / ``\"female\"`` for the primary face, or None."""
-        face = self._select_primary_face(frame, threshold=threshold)
+    @staticmethod
+    def _gender_label_from_face(face):
+        """Map InsightFace face attrs to ``male`` / ``female`` / None."""
         if face is None:
             return None
         # InsightFace genderage: 0 = female, 1 = male.
@@ -64,6 +117,29 @@ class FaceDetector:
         if g == 0:
             return "female"
         return None
+
+    def detect_gender(self, frame, threshold=0.5):
+        """Return ``\"male\"`` / ``\"female\"`` for the primary face, or None."""
+        face = self._select_primary_face(frame, threshold=threshold)
+        return self._gender_label_from_face(face)
+
+    def detect_gender_with_confidence(self, frame, threshold=0.5):
+        """Return ``(gender, confidence)`` for the primary face, or ``(None, None)``.
+
+        ``confidence`` is softmax(pred[:2]) of the predicted class in ``[0, 1]``.
+        """
+        face = self._select_primary_face(frame, threshold=threshold)
+        label = self._gender_label_from_face(face)
+        if label is None:
+            return None, None
+        conf = getattr(face, "gender_confidence", None)
+        if conf is None:
+            scores = getattr(face, "gender_scores", None)
+            if scores is not None and len(scores) >= 2:
+                conf = float(scores[1] if label == "male" else scores[0])
+        if conf is None:
+            return label, None
+        return label, float(conf)
 
     def __call__(self, frame, threshold=0.5):
         f_h, f_w, _ = frame.shape

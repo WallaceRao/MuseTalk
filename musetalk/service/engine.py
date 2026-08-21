@@ -147,7 +147,7 @@ class ServiceConfig:
     # Downscale for detection when short side exceeds this; <= threshold keeps original.
     detect_short_side: int = 720
     # Ignore faces smaller than this fraction of the full frame area (no track/ASD/lipsync).
-    min_face_area_ratio: float = 1.0 / 100.0
+    min_face_area_ratio: float = 0.005
     # CodeFormer: restore only MuseTalk-generated speaking-face crops.
     use_codeformer: bool = True
     codeformer_model_path: str = "./models/codeformer/codeformer.pth"

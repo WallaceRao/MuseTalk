@@ -1128,6 +1128,129 @@ def expand_speaking_mask_within_vad(
     return out
 
 
+def expand_speaking_mask_same_speaker_shots(
+    speaking_mask: Sequence[bool],
+    shot_ids: Sequence[int],
+    *,
+    assigned_segments: Sequence[Tuple[float, float, int]] | None = None,
+    primary_track_id: int | None = None,
+    other_visual: Sequence[bool] | None = None,
+    face_counts: Sequence[int] | None = None,
+    valid_face: Sequence[bool] | None = None,
+    include_silence_when_single_face: bool = True,
+    fps: float = LR_ASD_FPS,
+) -> Tuple[List[bool], dict]:
+    """Fill each single-speaker shot for lipsync continuity.
+
+    When a shot has no other-speaker visual activity (or all assigned dialogue
+    belongs to the MuseTalk primary track):
+
+    - Default: lipsync every valid-face frame between the first and last
+      speaking frame (merge multi-segment gaps of the same person).
+    - If ``include_silence_when_single_face`` and the shot never shows more
+      than one face at once, fill the **entire shot** (including silence) so
+      original talking mouths can be driven closed by silent audio.
+
+    Prefer ``other_visual`` when available: primary face-track IDs often
+    fragment across segments of the same person, which would falsely look
+    like multi-speaker if we only inspected assigned speaker ids.
+    """
+    n = len(speaking_mask)
+    out = list(speaking_mask)
+    meta = {
+        "expanded_shots": 0,
+        "expanded_frames": 0,
+        "silence_fill_shots": 0,
+        "checked_shots": 0,
+        "skipped_multi_speaker": 0,
+        "skipped_non_primary": 0,
+        "skipped_no_speak": 0,
+        "skipped_multi_face": 0,
+    }
+    if n == 0:
+        return out, meta
+    if len(shot_ids) != n:
+        raise ValueError("shot_ids length must match speaking_mask")
+    if valid_face is not None and len(valid_face) != n:
+        raise ValueError("valid_face length must match speaking_mask")
+    if other_visual is not None and len(other_visual) != n:
+        raise ValueError("other_visual length must match speaking_mask")
+    if face_counts is not None and len(face_counts) != n:
+        raise ValueError("face_counts length must match speaking_mask")
+
+    fps = float(fps) if fps and fps > 0 else LR_ASD_FPS
+    shot_range = _shot_ranges(shot_ids)
+    assigned = list(assigned_segments or [])
+
+    for sid, (s0, s1) in shot_range.items():
+        meta["checked_shots"] += 1
+        speak_idxs = [i for i in range(s0, s1) if speaking_mask[i]]
+        if not speak_idxs:
+            meta["skipped_no_speak"] += 1
+            continue
+
+        # Strong signal: another face has visual speaking in this shot.
+        if other_visual is not None:
+            if any(other_visual[i] for i in range(s0, s1)):
+                meta["skipped_multi_speaker"] += 1
+                continue
+        else:
+            t0 = s0 / fps
+            t1 = s1 / fps
+            onscreen: set[int] = set()
+            if assigned:
+                for a, b, spk in assigned:
+                    a_f, b_f = float(a), float(b)
+                    if b_f <= t0 or a_f >= t1:
+                        continue
+                    if int(spk) >= 0:
+                        onscreen.add(int(spk))
+            # No assignment info: treat as single primary speaker if we have speaking.
+            if not assigned:
+                if primary_track_id is not None:
+                    onscreen = {int(primary_track_id)}
+                else:
+                    onscreen = {0}
+
+            if len(onscreen) == 0:
+                meta["skipped_no_speak"] += 1
+                continue
+            if len(onscreen) > 1:
+                meta["skipped_multi_speaker"] += 1
+                continue
+            only = next(iter(onscreen))
+            if primary_track_id is not None and int(only) != int(primary_track_id):
+                meta["skipped_non_primary"] += 1
+                continue
+
+        single_face = False
+        if include_silence_when_single_face and face_counts is not None:
+            max_faces = max((int(face_counts[i]) for i in range(s0, s1)), default=0)
+            if max_faces <= 1:
+                single_face = True
+            else:
+                meta["skipped_multi_face"] += 1
+
+        if single_face:
+            fill_lo, fill_hi = s0, s1 - 1
+            meta["silence_fill_shots"] += 1
+        else:
+            fill_lo, fill_hi = speak_idxs[0], speak_idxs[-1]
+
+        added = 0
+        for i in range(fill_lo, fill_hi + 1):
+            if valid_face is not None and not valid_face[i]:
+                continue
+            if not out[i]:
+                added += 1
+            out[i] = True
+        if added > 0:
+            meta["expanded_shots"] += 1
+            meta["expanded_frames"] += added
+
+    return out, meta
+
+
 def expand_speaking_mask_to_shots(
     speaking_mask: Sequence[bool],
     shot_ids: Sequence[int],

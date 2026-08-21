@@ -32,11 +32,13 @@ from musetalk.utils.active_speaker import (
     VSDLMDetector,
     detect_shot_ids,
     dilate_speaking_mask,
+    expand_speaking_mask_same_speaker_shots,
     expand_speaking_mask_to_shots,
     expand_speaking_mask_within_vad,
     prune_short_speaking_runs,
 )
 from musetalk.utils.vad_vsdlm_fusion import build_fused_speaking_mask
+from musetalk.utils.yaw_gate import apply_yaw_turn_gate, yaw_blend_weight
 from musetalk.utils.audio_processor import AudioProcessor
 from musetalk.utils.blending import (
     blend_frames,
@@ -124,6 +126,12 @@ class ServiceConfig:
     # After speaking detection: lipsync whole shots that contain speaking
     # long enough to pass ``lipsync_shot_min_speak_sec``.
     lipsync_full_speaking_shots: bool = False
+    # Same shot + all on-screen dialogue from the MuseTalk primary speaker →
+    # fill lipsync from first to last speaking frame in that shot (merge gaps).
+    lipsync_same_speaker_fill_shot: bool = True
+    # When that shot also never shows >1 face, fill the whole shot including
+    # silence so original talking mouths can close on silent reference audio.
+    lipsync_single_face_include_silence: bool = True
     # Contiguous speaking (post-dilate) required inside a shot before expanding
     # lipsync to the whole shot. Filters brief VSDLM false positives
     # (e.g. ~19/33/46/54/93s). 1.5s is stricter than V1's 1.1s (drops ~20s FP expands).
@@ -147,7 +155,7 @@ class ServiceConfig:
     # Downscale for detection when short side exceeds this; <= threshold keeps original.
     detect_short_side: int = 720
     # Ignore faces smaller than this fraction of the full frame area (no track/ASD/lipsync).
-    min_face_area_ratio: float = 0.005
+    min_face_area_ratio: float = 0.003
     # CodeFormer: restore only MuseTalk-generated speaking-face crops.
     use_codeformer: bool = True
     codeformer_model_path: str = "./models/codeformer/codeformer.pth"
@@ -160,6 +168,20 @@ class ServiceConfig:
     codeformer_stride: int = 1
     # Soften lipsync↔original transitions over N frames at each speaking-segment edge.
     blend_ramp_frames: int = 5
+    # Drop lipsync on large head yaw / fast turns; composite fades back to original.
+    lipsync_yaw_gate: bool = True
+    # |nose–eye asymmetry| above this ≈ three-quarter/profile → clear speaking.
+    # Raised from 0.28: mild look-aside (~10s, peak ~0.46 proxy) was over-cleared;
+    # 0.40 keeps only stronger turns.
+    lipsync_yaw_abs_max: float = 0.40
+    # |Δyaw| * fps above this ≈ snap turn → clear speaking.
+    # Widened from 1.5: landmark jitter was firing false fast-turns.
+    lipsync_yaw_turn_rate_max: float = 2.5
+    # Deprecated for hard clear (was clearing lead-in talking mouths). Kept at 0;
+    # segment edges use blend_ramp + yaw_blend_weight instead.
+    lipsync_yaw_gate_pad_frames: int = 0
+    # Soft composite fade: full lipsync below soft_start, 0 at abs_max.
+    lipsync_yaw_soft_start: float = 0.28
     # Match generated face crop colors to the original crop before parsing blend.
     use_color_match: bool = True
     # Max simultaneous inference jobs (one engine instance per slot).
@@ -631,13 +653,15 @@ class MuseTalkEngine:
                 cfg.detect_short_side,
                 cfg.min_face_area_ratio,
             )
-            coord_list, frame_list, mouth_coord_list, mouth_mar_list = get_landmark_and_bbox(
-                upperbondrange=bbox_shift,
-                detect_stride=cfg.bbox_detect_stride,
-                frames=frame_list,
-                detect_short_side=cfg.detect_short_side,
-                min_face_area_ratio=cfg.min_face_area_ratio,
-                return_mouth_coords=True,
+            coord_list, frame_list, mouth_coord_list, mouth_mar_list, yaw_list = (
+                get_landmark_and_bbox(
+                    upperbondrange=bbox_shift,
+                    detect_stride=cfg.bbox_detect_stride,
+                    frames=frame_list,
+                    detect_short_side=cfg.detect_short_side,
+                    min_face_area_ratio=cfg.min_face_area_ratio,
+                    return_mouth_coords=True,
+                )
             )
 
             if whisper_chunks is not None:
@@ -649,6 +673,7 @@ class MuseTalkEngine:
             frame_list = frame_list[:video_num]
             mouth_coord_list = mouth_coord_list[:video_num]
             mouth_mar_list = mouth_mar_list[:video_num]
+            yaw_list = yaw_list[:video_num]
 
             speaking_mask = None
             speaking_frames = 0
@@ -886,6 +911,67 @@ class MuseTalkEngine:
                     cfg.asd_mask_dilate,
                     cfg.vsdlm_min_speak_duration_sec,
                 )
+
+                if (
+                    cfg.lipsync_same_speaker_fill_shot
+                    and speaking_mask is not None
+                    and speaking_frames > 0
+                ):
+                    fill_shot_ids = None
+                    if fusion_meta is not None and fusion_meta.get("shot_ids") is not None:
+                        fill_shot_ids = list(fusion_meta["shot_ids"])[:video_num]
+                    else:
+                        fill_shot_ids = detect_shot_ids(
+                            frame_list[:video_num],
+                            hist_threshold=cfg.shot_cut_hist_threshold,
+                        )
+                    assigned = None
+                    primary_tid = None
+                    other_vis = None
+                    face_counts = None
+                    if fusion_meta is not None:
+                        assigned = fusion_meta.get("assigned_segments")
+                        primary_tid = fusion_meta.get("primary_track_id")
+                        ov = fusion_meta.get("other_visual")
+                        if ov is not None:
+                            other_vis = list(ov)[:video_num]
+                        fc = fusion_meta.get("face_counts")
+                        if fc is not None:
+                            face_counts = [int(x) for x in fc[:video_num]]
+                    valid_face_fill = [
+                        b != coord_placeholder for b in coord_list[:video_num]
+                    ]
+                    before_fill = sum(speaking_mask)
+                    speaking_mask, fill_meta = expand_speaking_mask_same_speaker_shots(
+                        speaking_mask,
+                        fill_shot_ids,
+                        assigned_segments=assigned,
+                        primary_track_id=primary_tid,
+                        other_visual=other_vis,
+                        face_counts=face_counts,
+                        valid_face=valid_face_fill,
+                        include_silence_when_single_face=(
+                            cfg.lipsync_single_face_include_silence
+                        ),
+                        fps=fps,
+                    )
+                    speaking_frames = sum(speaking_mask)
+                    logger.info(
+                        "Same-speaker shot fill: %d shots (+%d frames) "
+                        "%d → %d/%d (checked=%d, silence_fill=%d, multi=%d, "
+                        "multi_face=%d, non_primary=%d, no_speak=%d)",
+                        fill_meta["expanded_shots"],
+                        fill_meta["expanded_frames"],
+                        before_fill,
+                        speaking_frames,
+                        video_num,
+                        fill_meta["checked_shots"],
+                        fill_meta.get("silence_fill_shots", 0),
+                        fill_meta["skipped_multi_speaker"],
+                        fill_meta.get("skipped_multi_face", 0),
+                        fill_meta["skipped_non_primary"],
+                        fill_meta["skipped_no_speak"],
+                    )
             elif cfg.use_lr_asd and self.asd_detector is not None:
                 logger.info("Running LR-ASD active speaker detection")
                 speaking_mask, _ = self.asd_detector.compute_speaking_mask(
@@ -1038,6 +1124,38 @@ class MuseTalkEngine:
             infer_indices = []
             frame_h0, frame_w0 = frame_list[0].shape[:2]
             min_area = cfg.min_face_area_ratio * float(frame_w0 * frame_h0)
+
+            if (
+                cfg.lipsync_yaw_gate
+                and speaking_mask is not None
+                and yaw_list is not None
+                and sum(speaking_mask) > 0
+            ):
+                before_yaw = sum(speaking_mask)
+                speaking_mask, yaw_meta = apply_yaw_turn_gate(
+                    speaking_mask,
+                    yaw_list,
+                    fps=fps,
+                    abs_yaw_max=cfg.lipsync_yaw_abs_max,
+                    turn_rate_max=cfg.lipsync_yaw_turn_rate_max,
+                    pad_frames=cfg.lipsync_yaw_gate_pad_frames,
+                )
+                speaking_frames = sum(speaking_mask)
+                if yaw_meta.get("cleared_frames"):
+                    logger.info(
+                        "Yaw/turn gate: cleared %d frames %d → %d/%d "
+                        "(abs>=%.2f, rate>=%.2f/s, pad±%d, high_yaw=%d, fast_turn=%d)",
+                        yaw_meta["cleared_frames"],
+                        before_yaw,
+                        speaking_frames,
+                        video_num,
+                        yaw_meta["abs_yaw_max"],
+                        yaw_meta["turn_rate_max"],
+                        yaw_meta["pad_frames"],
+                        yaw_meta["high_yaw_frames"],
+                        yaw_meta["fast_turn_frames"],
+                    )
+
             for i in range(video_num):
                 if not speaking_mask[i]:
                     continue
@@ -1156,6 +1274,12 @@ class MuseTalkEngine:
                             writer.write(ori_frame)
                             continue
                         alpha = blend_alphas[i] if i < len(blend_alphas) else 1.0
+                        if cfg.lipsync_yaw_gate and yaw_list is not None and i < len(yaw_list):
+                            alpha *= yaw_blend_weight(
+                                yaw_list[i],
+                                soft_start=cfg.lipsync_yaw_soft_start,
+                                hard_max=cfg.lipsync_yaw_abs_max,
+                            )
                         if alpha <= 0.001:
                             writer.write(ori_frame)
                             continue

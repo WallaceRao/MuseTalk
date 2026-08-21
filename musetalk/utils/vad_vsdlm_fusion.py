@@ -875,6 +875,8 @@ def build_fused_speaking_mask(
         "active_speaker_switched_frames": switched,
         "vad_frames": sum(vad_mask),
         "other_speaker_frames": sum(other_visual),
+        "other_visual": list(other_visual),
+        "face_counts": [len(ft) for ft in frame_tracks],
         "raw_speaking_frames": sum(mask),
         "n_shots": n_shots,
         "shot_ids": list(shot_ids) if shot_ids is not None else None,

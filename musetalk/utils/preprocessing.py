@@ -13,6 +13,10 @@ import torch
 from tqdm import tqdm
 
 from musetalk.utils.scrfd_detector import SCRFDDetector
+from musetalk.utils.yaw_gate import (
+    interpolate_sparse_yaw,
+    yaw_proxy_from_face_landmarks,
+)
 
 logger = logging.getLogger("musetalk_service")
 
@@ -375,9 +379,11 @@ def _detect_bbox_for_frame(
       3. If no face → placeholder (skip pose).
       4. DWPose-M topdown on an expanded face box → MuseTalk half-face crop.
 
-    Returns (bbox, range_minus, range_plus, held, mouth_bbox, mouth_mar).
+    Returns
+    ``(bbox, range_minus, range_plus, held, mouth_bbox, mouth_mar, yaw)``.
     ``held`` is always False now. ``mouth_bbox`` / ``mouth_mar`` come from lip
-    landmarks when available.
+    landmarks when available. ``yaw`` is a nose–eye asymmetry proxy in
+    roughly ``[-1, 1]`` (``None`` when unavailable).
     """
     h_orig, w_orig = frame.shape[:2]
     detect_frame, scale_x, scale_y = _resize_for_detection(frame, detect_short_side)
@@ -399,7 +405,7 @@ def _detect_bbox_for_frame(
     ]
     frame_shape = (h_det, w_det)
     if not scrfd_faces:
-        return coord_placeholder, None, None, False, None, None
+        return coord_placeholder, None, None, False, None, None, None
 
     scrfd_cands = [
         {"bbox": f, "range_minus": None, "range_plus": None} for f in scrfd_faces
@@ -409,7 +415,7 @@ def _detect_bbox_for_frame(
     )
     if selected_face is None:
         if prev_det is not None:
-            return coord_placeholder, None, None, False, None, None
+            return coord_placeholder, None, None, False, None, None, None
         selected_face = max(
             scrfd_cands, key=lambda c: _seed_face_score(c["bbox"], w_det, h_det)
         )
@@ -419,8 +425,8 @@ def _detect_bbox_for_frame(
     if pose_bbox[2] <= pose_bbox[0] or pose_bbox[3] <= pose_bbox[1]:
         out_bbox = _scale_bbox_to_original(face_bbox, scale_x, scale_y)
         if not _face_meets_min_area(out_bbox, w_orig, h_orig, min_face_area_ratio):
-            return coord_placeholder, None, None, False, None, None
-        return out_bbox, None, None, False, None, None
+            return coord_placeholder, None, None, False, None, None, None
+        return out_bbox, None, None, False, None, None, None
 
     results = inference_topdown(
         model,
@@ -433,6 +439,7 @@ def _detect_bbox_for_frame(
     selected = None
     mouth_det = None
     mouth_mar = None
+    yaw = None
     if keypoints is not None and len(keypoints) > 0:
         face_land_mark = np.asarray(keypoints[0][23:91], dtype=np.float64)
         if (
@@ -451,12 +458,13 @@ def _detect_bbox_for_frame(
                     "range_plus": range_plus,
                 }
             mouth_det, mouth_mar = _mouth_bbox_from_face_landmarks(face_land_mark)
+            yaw = yaw_proxy_from_face_landmarks(face_land_mark)
 
     if selected is None:
         out_bbox = _scale_bbox_to_original(face_bbox, scale_x, scale_y)
         if not _face_meets_min_area(out_bbox, w_orig, h_orig, min_face_area_ratio):
-            return coord_placeholder, None, None, False, None, None
-        return out_bbox, None, None, False, None, None
+            return coord_placeholder, None, None, False, None, None, None
+        return out_bbox, None, None, False, None, None, yaw
 
     f_landmark = selected["bbox"]
     x1, y1, x2, y2 = f_landmark
@@ -474,7 +482,7 @@ def _detect_bbox_for_frame(
         range_plus = selected.get("range_plus")
 
     if not _face_meets_min_area(out_bbox, w_orig, h_orig, min_face_area_ratio):
-        return coord_placeholder, None, None, False, None, None
+        return coord_placeholder, None, None, False, None, None, None
 
     if range_minus is not None:
         range_minus = float(range_minus) * scale_y
@@ -487,7 +495,7 @@ def _detect_bbox_for_frame(
             w_orig,
             h_orig,
         )
-    return out_bbox, range_minus, range_plus, False, mouth_bbox, mouth_mar
+    return out_bbox, range_minus, range_plus, False, mouth_bbox, mouth_mar, yaw
 
 
 
@@ -592,7 +600,8 @@ def get_landmark_and_bbox(
     at or below detect_short_side are unchanged.
 
     When ``return_mouth_coords`` is True, also return per-frame tight mouth
-    boxes from DWPose lip landmarks (or None when unavailable).
+    boxes from DWPose lip landmarks (or None when unavailable), mouth MAR,
+    and a yaw proxy list (nose–eye asymmetry, or None).
     """
     if frames is None:
         if not img_list:
@@ -629,6 +638,7 @@ def get_landmark_and_bbox(
     sparse_coords = [None] * n_frames
     sparse_mouth = [None] * n_frames
     sparse_mar = [None] * n_frames
+    sparse_yaw = [None] * n_frames
     average_range_minus = []
     average_range_plus = []
 
@@ -638,16 +648,19 @@ def get_landmark_and_bbox(
 
     prev_bbox = None
     for idx in tqdm(detect_indices):
-        bbox, range_minus, range_plus, _held, mouth_bbox, mouth_mar = _detect_bbox_for_frame(
-            frames[idx],
-            upperbondrange,
-            detect_short_side=detect_short_side,
-            prev_bbox=prev_bbox,
-            min_face_area_ratio=min_face_area_ratio,
+        bbox, range_minus, range_plus, _held, mouth_bbox, mouth_mar, yaw = (
+            _detect_bbox_for_frame(
+                frames[idx],
+                upperbondrange,
+                detect_short_side=detect_short_side,
+                prev_bbox=prev_bbox,
+                min_face_area_ratio=min_face_area_ratio,
+            )
         )
         sparse_coords[idx] = bbox
         sparse_mouth[idx] = mouth_bbox
         sparse_mar[idx] = mouth_mar
+        sparse_yaw[idx] = yaw
         # Clear track on lost face so we never keep pasting on an empty shot.
         if bbox == coord_placeholder:
             prev_bbox = None
@@ -666,6 +679,11 @@ def get_landmark_and_bbox(
         sparse_mouth
         if detect_stride == 1
         else _interpolate_sparse_mouth_coords(sparse_mouth, sparse_coords, n_frames)
+    )
+    yaw_list = (
+        sparse_yaw
+        if detect_stride == 1
+        else interpolate_sparse_yaw(sparse_yaw, n_frames)
     )
     # MAR: hold last keyframe value (do not lerp across gaps).
     mouth_mar_list = [None] * n_frames
@@ -695,7 +713,7 @@ def get_landmark_and_bbox(
         print(f"Total frame:「{n_frames}」 No valid face ranges, current value: {upperbondrange}")
     print("*************************************************************************************************************************************")
     if return_mouth_coords:
-        return coords_list, frames, mouth_coords_list, mouth_mar_list
+        return coords_list, frames, mouth_coords_list, mouth_mar_list, yaw_list
     return coords_list, frames
 
 

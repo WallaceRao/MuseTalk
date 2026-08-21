@@ -84,14 +84,14 @@ if __name__ == "__main__":
     
     video = '/opt/oss/wujiedub/video_translate/20260719/13/1088/category_task/1346/83366/58543_969_1088_watermarked.mp4'
 
-    video = '/opt/oss/wujiedub/video_translate/20260719/21/1088/category_task/1368/84977/31656_568_1088_watermarked.mp4'
+    video = '/opt/oss/wujiedub/video_translate/20260821/14/3/input_videos/9aa8c8f146_1080p.mp4'
     audio = '2min.wav'
     #audio = '/opt/oss/wujiedub/video_translate/20260717/14/1088/category_task/1284/79010/translated_voice.wav'
     audio = '/opt/oss/wujiedub/video_translate/20260719/13/1088/category_task/1346/83366/translated_voice.wav'
-    audio = '/opt/oss/wujiedub/video_translate/20260719/21/1088/category_task/1368/84977/translated_voice.wav'
+    audio = '/opt/oss/wujiedub/video_translate/20260821/14/3/task/161080/translated_voice.wav'
     output = '/home/ubuntu/raoyonghui/MuseTalk/test_output.mp4'
 
-    intermediate_file_path = '/opt/oss/wujiedub/video_translate/20260719/21/1088/category_task/1368/84977/intermediate_result.json'
+    intermediate_file_path = '/opt/oss/wujiedub/video_translate/20260821/14/3/task/161080/intermediate_result.json'
 
     vad_result = get_vad_result_from_intermediate_file(intermediate_file_path)
 

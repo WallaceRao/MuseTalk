@@ -48,6 +48,11 @@ from musetalk.utils.blending import (
     paste_lipsync_in_bbox,
 )
 from musetalk.utils.face_parsing import FaceParsing
+from musetalk.utils.mouth_occlusion import (
+    apply_mouth_occlusion_gate,
+    estimate_mouth_visibility_sequence,
+    mouth_occlusion_blend_weight,
+)
 from musetalk.utils.preprocessing import (
     _bbox_iou,
     coord_placeholder,
@@ -179,6 +184,14 @@ class ServiceConfig:
     )
     # Estimate yaw every N frames (intermediates interpolated); 0 → bbox_detect_stride.
     lipsync_yaw_stride: int = 0
+    # Skip lipsync when mouth/lower-face is partially occluded (BiSeNet parsing).
+    lipsync_mouth_occlusion_gate: bool = True
+    # Hard-clear speaking when lip visibility in mouth ROI is below this.
+    lipsync_mouth_vis_clear: float = 0.25
+    # Soft composite fade: full lipsync above this, 0 at clear threshold.
+    lipsync_mouth_vis_full: float = 0.55
+    # Score every N speaking frames (interp between); 0 → bbox_detect_stride.
+    lipsync_mouth_occlusion_stride: int = 0
     # Match generated face crop colors to the original crop before parsing blend.
     use_color_match: bool = True
     # Max simultaneous inference jobs (one engine instance per slot).
@@ -233,6 +246,25 @@ class MuseTalkEngine:
             "ls",
             "v2",
         }
+
+    def _get_face_parser(self):
+        """FaceParsing (BiSeNet) for blend masks and mouth-occlusion gating."""
+        if self.fp is not None:
+            return self.fp
+        cfg = self.config
+        try:
+            if cfg.version == "v15":
+                self.fp = FaceParsing(
+                    left_cheek_width=cfg.left_cheek_width,
+                    right_cheek_width=cfg.right_cheek_width,
+                )
+            else:
+                self.fp = FaceParsing()
+            logger.info("FaceParsing loaded for mouth-occlusion gate / blending")
+            return self.fp
+        except Exception as exc:
+            logger.warning("FaceParsing unavailable: %s", exc)
+            return None
 
     def _get_yaw_estimator(self):
         """InsightFace 1k3d68 yaw estimator for the lipsync yaw gate."""
@@ -1151,6 +1183,7 @@ class MuseTalkEngine:
             infer_indices = []
             frame_h0, frame_w0 = frame_list[0].shape[:2]
             min_area = cfg.min_face_area_ratio * float(frame_w0 * frame_h0)
+            mouth_vis_list = None
 
             if cfg.lipsync_yaw_gate and speaking_mask is not None and sum(speaking_mask) > 0:
                 yaw_estimator = self._get_yaw_estimator()
@@ -1219,6 +1252,74 @@ class MuseTalkEngine:
                             yaw_meta["shots"],
                             yaw_meta["entered_off"],
                             yaw_meta["reentered_on"],
+                        )
+
+            mouth_vis_list = None
+            if (
+                cfg.lipsync_mouth_occlusion_gate
+                and speaking_mask is not None
+                and sum(speaking_mask) > 0
+            ):
+                face_parser = self._get_face_parser()
+                if face_parser is None:
+                    logger.warning(
+                        "Mouth occlusion gate enabled but FaceParsing unavailable; skipping"
+                    )
+                else:
+                    occ_stride = (
+                        int(cfg.lipsync_mouth_occlusion_stride)
+                        if cfg.lipsync_mouth_occlusion_stride
+                        and cfg.lipsync_mouth_occlusion_stride > 0
+                        else int(cfg.bbox_detect_stride)
+                    )
+                    occ_indices = [
+                        i
+                        for i in range(video_num)
+                        if speaking_mask[i]
+                        and i < len(coord_list)
+                        and coord_list[i] != coord_placeholder
+                    ]
+                    logger.info(
+                        "Scoring mouth occlusion for %d speaking frames "
+                        "(stride=%d, clear<%.2f, full>=%.2f)",
+                        len(occ_indices),
+                        occ_stride,
+                        cfg.lipsync_mouth_vis_clear,
+                        cfg.lipsync_mouth_vis_full,
+                    )
+                    mouth_vis_list = estimate_mouth_visibility_sequence(
+                        frame_list[:video_num],
+                        coord_list[:video_num],
+                        face_parser,
+                        mouth_coord_list=mouth_coord_list[:video_num]
+                        if mouth_coord_list is not None
+                        else None,
+                        indices=occ_indices,
+                        stride=occ_stride,
+                        coord_placeholder=coord_placeholder,
+                    )
+                    before_occ = sum(speaking_mask)
+                    speaking_mask, occ_meta = apply_mouth_occlusion_gate(
+                        speaking_mask,
+                        mouth_vis_list,
+                        clear_below=cfg.lipsync_mouth_vis_clear,
+                    )
+                    speaking_frames = sum(speaking_mask)
+                    if occ_meta.get("cleared_frames"):
+                        logger.info(
+                            "Mouth occlusion gate: cleared %d frames %d → %d/%d "
+                            "(vis<%.2f, scored=%d, min_vis=%s)",
+                            occ_meta["cleared_frames"],
+                            before_occ,
+                            speaking_frames,
+                            video_num,
+                            occ_meta["clear_below"],
+                            occ_meta["scored_frames"],
+                            (
+                                f"{occ_meta['min_visibility']:.3f}"
+                                if occ_meta.get("min_visibility") is not None
+                                else "n/a"
+                            ),
                         )
 
             for i in range(video_num):
@@ -1339,6 +1440,16 @@ class MuseTalkEngine:
                             writer.write(ori_frame)
                             continue
                         alpha = blend_alphas[i] if i < len(blend_alphas) else 1.0
+                        if (
+                            cfg.lipsync_mouth_occlusion_gate
+                            and mouth_vis_list is not None
+                            and i < len(mouth_vis_list)
+                        ):
+                            alpha *= mouth_occlusion_blend_weight(
+                                mouth_vis_list[i],
+                                clear_below=cfg.lipsync_mouth_vis_clear,
+                                full_above=cfg.lipsync_mouth_vis_full,
+                            )
                         if alpha <= 0.001:
                             writer.write(ori_frame)
                             continue
@@ -1475,6 +1586,16 @@ class MuseTalkEngine:
                             continue
 
                         alpha = blend_alphas[i] if i < len(blend_alphas) else 1.0
+                        if (
+                            cfg.lipsync_mouth_occlusion_gate
+                            and mouth_vis_list is not None
+                            and i < len(mouth_vis_list)
+                        ):
+                            alpha *= mouth_occlusion_blend_weight(
+                                mouth_vis_list[i],
+                                clear_below=cfg.lipsync_mouth_vis_clear,
+                                full_above=cfg.lipsync_mouth_vis_full,
+                            )
                         if alpha <= 0.001:
                             writer.write(ori_frame)
                             continue

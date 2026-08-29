@@ -74,11 +74,17 @@ class FaceParsing():
             transforms.Normalize((0.485, 0.456, 0.406), (0.229, 0.224, 0.225)),
         ])
 
-    def __call__(self, image, size=(512, 512), mode="raw"):
+    def parse_labels(self, image, size=(512, 512)):
+        """Return raw BiSeNet class-id map (H×W int), resized to ``size``."""
         if isinstance(image, str):
             image = Image.open(image)
+        elif isinstance(image, np.ndarray):
+            # Accept BGR (OpenCV) or RGB; treat 3-channel ndarray as BGR→RGB.
+            if image.ndim == 3 and image.shape[2] == 3:
+                image = Image.fromarray(cv2.cvtColor(image, cv2.COLOR_BGR2RGB))
+            else:
+                image = Image.fromarray(image)
 
-        width, height = image.size
         with torch.no_grad():
             image = image.resize(size, Image.BILINEAR)
             img = self.preprocess(image)
@@ -87,25 +93,32 @@ class FaceParsing():
             else:
                 img = torch.unsqueeze(img, 0)
             out = self.net(img)[0]
-            parsing = out.squeeze(0).cpu().numpy().argmax(0)
+            return out.squeeze(0).cpu().numpy().argmax(0).astype(np.int32)
+
+    def __call__(self, image, size=(512, 512), mode="raw"):
+        if isinstance(image, str):
+            image = Image.open(image)
+
+        width, height = image.size
+        parsing = self.parse_labels(image, size=size)
             
-            # Add 14:neck, remove 10:nose and 7:8:9
-            if mode == "neck":
-                parsing[np.isin(parsing, [1, 11, 12, 13, 14])] = 255
-                parsing[np.where(parsing!=255)] = 0
-            elif mode == "jaw":
-                face_region = np.isin(parsing, [1])*255
-                face_region = face_region.astype(np.uint8)
-                original_dilated = cv2.dilate(face_region, self.kernel, iterations=1)
-                eroded = cv2.erode(original_dilated, self.cheek_kernel, iterations=2)
-                face_region = cv2.bitwise_and(eroded, self.cheek_mask)
-                face_region = cv2.bitwise_or(face_region, cv2.bitwise_and(original_dilated, ~self.cheek_mask))
-                parsing[(face_region==255) & (~np.isin(parsing, [10]))] = 255         
-                parsing[np.isin(parsing, [11, 12, 13])] = 255
-                parsing[np.where(parsing!=255)] = 0
-            else:
-                parsing[np.isin(parsing, [1, 11, 12, 13])] = 255
-                parsing[np.where(parsing!=255)] = 0
+        # Add 14:neck, remove 10:nose and 7:8:9
+        if mode == "neck":
+            parsing[np.isin(parsing, [1, 11, 12, 13, 14])] = 255
+            parsing[np.where(parsing!=255)] = 0
+        elif mode == "jaw":
+            face_region = np.isin(parsing, [1])*255
+            face_region = face_region.astype(np.uint8)
+            original_dilated = cv2.dilate(face_region, self.kernel, iterations=1)
+            eroded = cv2.erode(original_dilated, self.cheek_kernel, iterations=2)
+            face_region = cv2.bitwise_and(eroded, self.cheek_mask)
+            face_region = cv2.bitwise_or(face_region, cv2.bitwise_and(original_dilated, ~self.cheek_mask))
+            parsing[(face_region==255) & (~np.isin(parsing, [10]))] = 255         
+            parsing[np.isin(parsing, [11, 12, 13])] = 255
+            parsing[np.where(parsing!=255)] = 0
+        else:
+            parsing[np.isin(parsing, [1, 11, 12, 13])] = 255
+            parsing[np.where(parsing!=255)] = 0
 
         parsing = Image.fromarray(parsing.astype(np.uint8))
         return parsing

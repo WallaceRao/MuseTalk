@@ -38,7 +38,7 @@ from musetalk.utils.active_speaker import (
     prune_short_speaking_runs,
 )
 from musetalk.utils.vad_vsdlm_fusion import build_fused_speaking_mask
-from musetalk.utils.yaw_gate import apply_yaw_turn_gate, yaw_blend_weight
+from musetalk.utils.yaw_gate import apply_yaw_hysteresis_gate
 from musetalk.utils.audio_processor import AudioProcessor
 from musetalk.utils.blending import (
     blend_frames,
@@ -168,20 +168,17 @@ class ServiceConfig:
     codeformer_stride: int = 1
     # Soften lipsync↔original transitions over N frames at each speaking-segment edge.
     blend_ramp_frames: int = 5
-    # Drop lipsync on large head yaw / fast turns; composite fades back to original.
+    # Drop lipsync on large head yaw (InsightFace 1k3d68 degrees, per-shot hysteresis).
     lipsync_yaw_gate: bool = True
-    # |nose–eye asymmetry| above this ≈ three-quarter/profile → clear speaking.
-    # Raised from 0.28: mild look-aside (~10s, peak ~0.46 proxy) was over-cleared;
-    # 0.40 keeps only stronger turns.
-    lipsync_yaw_abs_max: float = 0.40
-    # |Δyaw| * fps above this ≈ snap turn → clear speaking.
-    # Widened from 1.5: landmark jitter was firing false fast-turns.
-    lipsync_yaw_turn_rate_max: float = 2.5
-    # Deprecated for hard clear (was clearing lead-in talking mouths). Kept at 0;
-    # segment edges use blend_ramp + yaw_blend_weight instead.
-    lipsync_yaw_gate_pad_frames: int = 0
-    # Soft composite fade: full lipsync below soft_start, 0 at abs_max.
-    lipsync_yaw_soft_start: float = 0.28
+    # Sync → non-sync when |yaw| reaches this (degrees).
+    lipsync_yaw_off_deg: float = 65.0
+    # Non-sync → sync again only after |yaw| returns within this (degrees).
+    lipsync_yaw_on_deg: float = 50.0
+    lipsync_yaw_model_path: str = (
+        "./models/latentsync15/auxiliary/models/buffalo_l/1k3d68.onnx"
+    )
+    # Estimate yaw every N frames (intermediates interpolated); 0 → bbox_detect_stride.
+    lipsync_yaw_stride: int = 0
     # Match generated face crop colors to the original crop before parsing blend.
     use_color_match: bool = True
     # Max simultaneous inference jobs (one engine instance per slot).
@@ -220,6 +217,7 @@ class MuseTalkEngine:
         self._ensure_ffmpeg()
         self._load_models()
         self._gender_face_detector = None
+        self._yaw_estimator = None
 
     def _ensure_ffmpeg(self) -> None:
         try:
@@ -235,6 +233,36 @@ class MuseTalkEngine:
             "ls",
             "v2",
         }
+
+    def _get_yaw_estimator(self):
+        """InsightFace 1k3d68 yaw estimator for the lipsync yaw gate."""
+        if self._yaw_estimator is not None:
+            return self._yaw_estimator
+        if self._yaw_estimator is False:
+            return None
+
+        cfg = self.config
+        model_path = os.path.abspath(cfg.lipsync_yaw_model_path)
+        if not os.path.isfile(model_path):
+            logger.warning(
+                "InsightFace 1k3d68 missing (%s); yaw gate disabled", model_path
+            )
+            self._yaw_estimator = False
+            return None
+        try:
+            from musetalk.utils.insightface_yaw import InsightFaceYawEstimator
+
+            providers = ["CPUExecutionProvider"]
+            if self.device.type == "cuda":
+                providers = ["CUDAExecutionProvider", "CPUExecutionProvider"]
+            self._yaw_estimator = InsightFaceYawEstimator(
+                model_path, providers=providers
+            )
+            return self._yaw_estimator
+        except Exception as exc:
+            logger.warning("InsightFace yaw estimator unavailable: %s", exc)
+            self._yaw_estimator = False
+            return None
 
     def _get_gender_face_detector(self):
         """FairFace ONNX gender detector for the speaking-mask gender gate."""
@@ -653,7 +681,7 @@ class MuseTalkEngine:
                 cfg.detect_short_side,
                 cfg.min_face_area_ratio,
             )
-            coord_list, frame_list, mouth_coord_list, mouth_mar_list, yaw_list = (
+            coord_list, frame_list, mouth_coord_list, mouth_mar_list = (
                 get_landmark_and_bbox(
                     upperbondrange=bbox_shift,
                     detect_stride=cfg.bbox_detect_stride,
@@ -673,7 +701,6 @@ class MuseTalkEngine:
             frame_list = frame_list[:video_num]
             mouth_coord_list = mouth_coord_list[:video_num]
             mouth_mar_list = mouth_mar_list[:video_num]
-            yaw_list = yaw_list[:video_num]
 
             speaking_mask = None
             speaking_frames = 0
@@ -1056,12 +1083,12 @@ class MuseTalkEngine:
 
             # Speaking detection stays as-is above. For lipsync, expand the
             # gate to whole camera shots that contain any speaking frame.
+            shot_ids_for_expand = None
             if (
                 cfg.lipsync_full_speaking_shots
                 and speaking_mask is not None
                 and speaking_frames < video_num
             ):
-                shot_ids_for_expand = None
                 if fusion_meta is not None and fusion_meta.get("shot_ids") is not None:
                     shot_ids_for_expand = list(fusion_meta["shot_ids"])[:video_num]
                 else:
@@ -1125,36 +1152,74 @@ class MuseTalkEngine:
             frame_h0, frame_w0 = frame_list[0].shape[:2]
             min_area = cfg.min_face_area_ratio * float(frame_w0 * frame_h0)
 
-            if (
-                cfg.lipsync_yaw_gate
-                and speaking_mask is not None
-                and yaw_list is not None
-                and sum(speaking_mask) > 0
-            ):
-                before_yaw = sum(speaking_mask)
-                speaking_mask, yaw_meta = apply_yaw_turn_gate(
-                    speaking_mask,
-                    yaw_list,
-                    fps=fps,
-                    abs_yaw_max=cfg.lipsync_yaw_abs_max,
-                    turn_rate_max=cfg.lipsync_yaw_turn_rate_max,
-                    pad_frames=cfg.lipsync_yaw_gate_pad_frames,
-                )
-                speaking_frames = sum(speaking_mask)
-                if yaw_meta.get("cleared_frames"):
-                    logger.info(
-                        "Yaw/turn gate: cleared %d frames %d → %d/%d "
-                        "(abs>=%.2f, rate>=%.2f/s, pad±%d, high_yaw=%d, fast_turn=%d)",
-                        yaw_meta["cleared_frames"],
-                        before_yaw,
-                        speaking_frames,
-                        video_num,
-                        yaw_meta["abs_yaw_max"],
-                        yaw_meta["turn_rate_max"],
-                        yaw_meta["pad_frames"],
-                        yaw_meta["high_yaw_frames"],
-                        yaw_meta["fast_turn_frames"],
+            if cfg.lipsync_yaw_gate and speaking_mask is not None and sum(speaking_mask) > 0:
+                yaw_estimator = self._get_yaw_estimator()
+                if yaw_estimator is None:
+                    logger.warning("Yaw gate enabled but estimator unavailable; skipping")
+                else:
+                    yaw_shot_ids = None
+                    if fusion_meta is not None and fusion_meta.get("shot_ids") is not None:
+                        yaw_shot_ids = list(fusion_meta["shot_ids"])[:video_num]
+                    elif shot_ids_for_expand is not None:
+                        yaw_shot_ids = list(shot_ids_for_expand)[:video_num]
+                    else:
+                        yaw_shot_ids = detect_shot_ids(
+                            frame_list[:video_num],
+                            hist_threshold=cfg.shot_cut_hist_threshold,
+                        )
+                    yaw_stride = (
+                        int(cfg.lipsync_yaw_stride)
+                        if cfg.lipsync_yaw_stride and cfg.lipsync_yaw_stride > 0
+                        else int(cfg.bbox_detect_stride)
                     )
+                    # Prefer speaking frames (+ neighbors with a box) so state tracks
+                    # the speaking face without paying for empty frames.
+                    yaw_indices = [
+                        i
+                        for i in range(video_num)
+                        if speaking_mask[i]
+                        or (
+                            i < len(coord_list)
+                            and coord_list[i] != coord_placeholder
+                        )
+                    ]
+                    logger.info(
+                        "Estimating InsightFace yaw for %d frames (stride=%d, off=%.0f°, on=%.0f°)",
+                        len(yaw_indices),
+                        yaw_stride,
+                        cfg.lipsync_yaw_off_deg,
+                        cfg.lipsync_yaw_on_deg,
+                    )
+                    yaw_list = yaw_estimator.estimate_sequence(
+                        frame_list[:video_num],
+                        coord_list[:video_num],
+                        coord_placeholder=coord_placeholder,
+                        stride=yaw_stride,
+                        indices=yaw_indices,
+                    )
+                    before_yaw = sum(speaking_mask)
+                    speaking_mask, yaw_meta = apply_yaw_hysteresis_gate(
+                        speaking_mask,
+                        yaw_list,
+                        yaw_shot_ids,
+                        off_deg=cfg.lipsync_yaw_off_deg,
+                        on_deg=cfg.lipsync_yaw_on_deg,
+                    )
+                    speaking_frames = sum(speaking_mask)
+                    if yaw_meta.get("cleared_frames") or yaw_meta.get("entered_off"):
+                        logger.info(
+                            "Yaw hysteresis gate: cleared %d frames %d → %d/%d "
+                            "(off>=%.0f°, on<=%.0f°, shots=%d, entered_off=%d, reentered_on=%d)",
+                            yaw_meta["cleared_frames"],
+                            before_yaw,
+                            speaking_frames,
+                            video_num,
+                            yaw_meta["off_deg"],
+                            yaw_meta["on_deg"],
+                            yaw_meta["shots"],
+                            yaw_meta["entered_off"],
+                            yaw_meta["reentered_on"],
+                        )
 
             for i in range(video_num):
                 if not speaking_mask[i]:
@@ -1274,12 +1339,6 @@ class MuseTalkEngine:
                             writer.write(ori_frame)
                             continue
                         alpha = blend_alphas[i] if i < len(blend_alphas) else 1.0
-                        if cfg.lipsync_yaw_gate and yaw_list is not None and i < len(yaw_list):
-                            alpha *= yaw_blend_weight(
-                                yaw_list[i],
-                                soft_start=cfg.lipsync_yaw_soft_start,
-                                hard_max=cfg.lipsync_yaw_abs_max,
-                            )
                         if alpha <= 0.001:
                             writer.write(ori_frame)
                             continue

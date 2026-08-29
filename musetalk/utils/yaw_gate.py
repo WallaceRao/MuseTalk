@@ -1,38 +1,9 @@
-"""Gate lipsync during large head yaw / fast turns (fade back to original)."""
+"""Gate lipsync during large head yaw (InsightFace degrees + shot hysteresis)."""
 
 from __future__ import annotations
 
 import math
 from typing import List, Optional, Sequence, Tuple
-
-import numpy as np
-
-
-def yaw_proxy_from_face_landmarks(face_land_mark) -> Optional[float]:
-    """Estimate yaw in roughly ``[-1, 1]`` from DWPose/68-pt face landmarks.
-
-    Uses nose–eye distance asymmetry: ``(d_left - d_right) / (d_left + d_right)``.
-    Near 0 ≈ frontal; magnitude grows toward profile. Returns ``None`` when
-    landmarks are unusable.
-    """
-    lm = np.asarray(face_land_mark, dtype=np.float64)
-    if lm.ndim != 2 or lm.shape[0] < 48 or lm.shape[1] < 2:
-        return None
-    if not np.isfinite(lm).all() or np.allclose(lm, 0):
-        return None
-    left_eye = lm[36:42].mean(axis=0)
-    right_eye = lm[42:48].mean(axis=0)
-    nose = lm[30]
-    d_left = float(np.linalg.norm(nose - left_eye))
-    d_right = float(np.linalg.norm(nose - right_eye))
-    denom = d_left + d_right
-    if denom < 1e-3:
-        return None
-    # Also reject near-degenerate eye spans (bad pose / partial face).
-    eye_w = float(np.linalg.norm(right_eye - left_eye))
-    if eye_w < 1.0:
-        return None
-    return float((d_left - d_right) / denom)
 
 
 def interpolate_sparse_yaw(
@@ -62,105 +33,71 @@ def interpolate_sparse_yaw(
     return out
 
 
-def yaw_blend_weight(
-    yaw: Optional[float],
-    *,
-    soft_start: float = 0.28,
-    hard_max: float = 0.40,
-) -> float:
-    """Opacity multiplier that fades lipsync as |yaw| approaches profile.
-
-    ``1`` while frontal (``|yaw| <= soft_start``), linearly down to ``0`` at
-    ``hard_max``. Used at composite time so near-threshold turns crossfade
-    even when the hard gate still keeps the frame.
-    """
-    if yaw is None:
-        return 1.0
-    try:
-        y = abs(float(yaw))
-    except (TypeError, ValueError):
-        return 1.0
-    if not math.isfinite(y):
-        return 1.0
-    soft = max(0.0, float(soft_start))
-    hard = max(soft, float(hard_max))
-    if y <= soft:
-        return 1.0
-    if y >= hard or hard <= soft:
-        return 0.0
-    return max(0.0, min(1.0, 1.0 - (y - soft) / (hard - soft)))
-
-
-def apply_yaw_turn_gate(
+def apply_yaw_hysteresis_gate(
     speaking_mask: Sequence[bool],
-    yaw_values: Sequence[Optional[float]],
+    yaw_deg: Sequence[Optional[float]],
+    shot_ids: Optional[Sequence[int]] = None,
     *,
-    fps: float,
-    abs_yaw_max: float = 0.40,
-    turn_rate_max: float = 2.5,
-    pad_frames: int = 0,
+    off_deg: float = 60.0,
+    on_deg: float = 45.0,
 ) -> Tuple[List[bool], dict]:
-    """Clear speaking frames with high |yaw| or fast yaw change.
+    """Clear speaking frames with per-shot yaw hysteresis.
 
-    Only core high-yaw / fast-turn frames are cleared (no neighbor pad).
-    Pad used to hard-clear lead-in frames and left original talking mouths
-    visible; edge soft-fade is left to ``blend_ramp`` + ``yaw_blend_weight``.
-    ``pad_frames`` is kept for API compatibility but ignored for hard clear.
+    Within each camera shot (or the whole clip if ``shot_ids`` is None):
+
+    - start in **sync** mode
+    - ``|yaw| >= off_deg`` → enter **non-sync** (cancel lipsync)
+    - stay non-sync until ``|yaw| <= on_deg`` → return to sync
+
+    Missing yaw values do not flip state. Shot boundaries reset to sync.
     """
     n = len(speaking_mask)
     out = list(speaking_mask)
+    off_thr = max(0.0, float(off_deg))
+    on_thr = max(0.0, float(on_deg))
+    if on_thr > off_thr:
+        on_thr = off_thr
+
     meta = {
         "cleared_frames": 0,
-        "high_yaw_frames": 0,
-        "fast_turn_frames": 0,
-        "pad_frames": 0,
-        "abs_yaw_max": float(abs_yaw_max),
-        "turn_rate_max": float(turn_rate_max),
+        "off_deg": off_thr,
+        "on_deg": on_thr,
+        "entered_off": 0,
+        "reentered_on": 0,
+        "shots": 0,
     }
     if n == 0:
         return out, meta
-    if len(yaw_values) != n:
-        raise ValueError("yaw_values length must match speaking_mask")
+    if len(yaw_deg) != n:
+        raise ValueError("yaw_deg length must match speaking_mask")
+    if shot_ids is not None and len(shot_ids) != n:
+        raise ValueError("shot_ids length must match speaking_mask")
 
-    fps = float(fps) if fps and fps > 0 else 25.0
-    abs_max = max(0.0, float(abs_yaw_max))
-    rate_max = max(0.0, float(turn_rate_max))
-    drop = [False] * n
-    _ = pad_frames  # unused: hard pad disabled
-
+    syncing = True
+    prev_shot: Optional[int] = None
     for i in range(n):
-        y = yaw_values[i]
-        if y is None:
-            continue
-        try:
-            yf = float(y)
-        except (TypeError, ValueError):
-            continue
-        if not math.isfinite(yf):
-            continue
-        if abs_max > 0 and abs(yf) >= abs_max:
-            drop[i] = True
-            meta["high_yaw_frames"] += 1
-        if i > 0 and rate_max > 0:
-            y0 = yaw_values[i - 1]
-            if y0 is None:
-                continue
+        sid = int(shot_ids[i]) if shot_ids is not None else 0
+        if prev_shot is None or sid != prev_shot:
+            syncing = True
+            prev_shot = sid
+            meta["shots"] += 1
+
+        y = yaw_deg[i]
+        if y is not None:
             try:
-                y0f = float(y0)
+                yf = abs(float(y))
             except (TypeError, ValueError):
-                continue
-            if not math.isfinite(y0f):
-                continue
-            rate = abs(yf - y0f) * fps
-            if rate >= rate_max:
-                drop[i] = True
-                drop[i - 1] = True
-                meta["fast_turn_frames"] += 1
+                yf = None
+            if yf is not None and math.isfinite(yf):
+                if syncing and yf >= off_thr:
+                    syncing = False
+                    meta["entered_off"] += 1
+                elif (not syncing) and yf <= on_thr:
+                    syncing = True
+                    meta["reentered_on"] += 1
 
-    cleared = 0
-    for i in range(n):
-        if drop[i] and out[i]:
+        if out[i] and not syncing:
             out[i] = False
-            cleared += 1
-    meta["cleared_frames"] = cleared
+            meta["cleared_frames"] += 1
+
     return out, meta

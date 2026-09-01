@@ -176,9 +176,9 @@ class ServiceConfig:
     # Drop lipsync on large head yaw (InsightFace 1k3d68 degrees, per-shot hysteresis).
     lipsync_yaw_gate: bool = True
     # Sync → non-sync when |yaw| reaches this (degrees).
-    lipsync_yaw_off_deg: float = 65.0
+    lipsync_yaw_off_deg: float = 75.0
     # Non-sync → sync again only after |yaw| returns within this (degrees).
-    lipsync_yaw_on_deg: float = 50.0
+    lipsync_yaw_on_deg: float = 65.0
     lipsync_yaw_model_path: str = (
         "./models/latentsync15/auxiliary/models/buffalo_l/1k3d68.onnx"
     )

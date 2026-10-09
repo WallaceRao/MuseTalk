@@ -5,6 +5,7 @@ import shutil
 import subprocess
 import sys
 import tempfile
+import time
 from dataclasses import dataclass
 from typing import List, Optional, Tuple
 
@@ -218,9 +219,10 @@ class ServiceConfig:
     # Lip generation backend: "latentsync" (V2 default) or "musetalk" (V1).
     lipsync_backend: str = "latentsync"
     latentsync_repo: str = "./third_party/LatentSync"
-    latentsync_unet_config: str = "./third_party/LatentSync/configs/unet/stage2.yaml"
-    latentsync_ckpt: str = "./models/latentsync15/latentsync_unet.pt"
-    latentsync_whisper: str = "./models/latentsync15/whisper/tiny.pt"
+    # LatentSync 1.6: 512x512 face-aligned U-Net (stage2_512.yaml) + stable_syncnet.
+    latentsync_unet_config: str = "./third_party/LatentSync/configs/unet/stage2_512.yaml"
+    latentsync_ckpt: str = "./models/latentsync16/latentsync_unet.pt"
+    latentsync_whisper: str = "./models/latentsync16/whisper/tiny.pt"
     latentsync_vae: str = "./models/sd-vae"
     latentsync_inference_steps: int = 30
     latentsync_guidance_scale: float = 1.5
@@ -370,7 +372,8 @@ class MuseTalkEngine:
         if self._use_latentsync:
             from musetalk.service.latentsync_backend import LatentSyncBackend
 
-            logger.info("Loading LatentSync 1.5 lipsync backend on %s", self.device)
+            logger.info("Loading LatentSync 1.6 lipsync backend on %s", self.device)
+            _backend_load_t0 = time.perf_counter()
             self.latentsync = LatentSyncBackend(
                 device=self.device,
                 repo_root=cfg.latentsync_repo,
@@ -383,6 +386,10 @@ class MuseTalkEngine:
                 enable_deepcache=cfg.latentsync_enable_deepcache,
                 seed=cfg.latentsync_seed,
                 use_float16=cfg.use_float16,
+            )
+            logger.info(
+                "[timing] latentsync backend load: %.3fs",
+                time.perf_counter() - _backend_load_t0,
             )
         else:
             logger.info("Loading MuseTalk models on %s", self.device)
@@ -662,6 +669,18 @@ class MuseTalkEngine:
         cfg = self.config
         bbox_shift = 0 if cfg.version == "v15" else cfg.bbox_shift
 
+        # Stage timing so the LatentSync 1.6 pipeline has an explicit per-phase
+        # baseline (decode / landmark / speaking-gate / inference / composite /
+        # mux) for later inference-acceleration work.
+        _t_total = time.perf_counter()
+        _t_mark = _t_total
+
+        def _stage(name: str) -> None:
+            nonlocal _t_mark
+            now = time.perf_counter()
+            logger.info("[timing] %s: %.3fs", name, now - _t_mark)
+            _t_mark = now
+
         with tempfile.TemporaryDirectory(prefix="musetalk_") as temp_root:
             temp_dir = os.path.join(temp_root, cfg.version)
             os.makedirs(temp_dir, exist_ok=True)
@@ -707,6 +726,8 @@ class MuseTalkEngine:
                 else:
                     raise ValueError(f"Unsupported video input: {video_path}")
 
+            _stage("decode")
+
             whisper_chunks = None
             if not self._use_latentsync:
                 whisper_input_features, librosa_length = self.audio_processor.get_audio_feature(
@@ -741,6 +762,8 @@ class MuseTalkEngine:
                 )
             )
 
+            _stage("landmark")
+
             if whisper_chunks is not None:
                 video_num = min(len(whisper_chunks), len(frame_list))
                 whisper_chunks = whisper_chunks[:video_num]
@@ -761,6 +784,7 @@ class MuseTalkEngine:
                         "client-provided" if vad_segments is not None else cfg.vad_url,
                         f", {len(vad_segments)} segs" if vad_segments is not None else "",
                     )
+                    _fusion_t0 = time.perf_counter()
                     speaking_mask, fusion_meta = build_fused_speaking_mask(
                         self.vsdlm_detector,
                         frame_list,
@@ -782,6 +806,9 @@ class MuseTalkEngine:
                         shot_fill_ratio=cfg.vsdlm_shot_fill_ratio,
                     )
                     speaking_mask = speaking_mask[:video_num]
+                    logger.info(
+                        "[timing] vad×vsdlm fusion: %.3fs", time.perf_counter() - _fusion_t0
+                    )
                     raw_speaking = int(fusion_meta.get("raw_speaking_frames", sum(speaking_mask)))
                     logger.info(
                         "VAD×VSDLM: shots=%s tracks=%s visual_iv=%s vad=%s assigned=%s primary=%s raw=%d/%d",
@@ -1377,6 +1404,7 @@ class MuseTalkEngine:
 
             res_by_index: dict[int, np.ndarray] = {}
             full_frame_by_index: dict[int, np.ndarray] = {}
+            _stage("speaking-gate")
             if infer_indices and self._use_latentsync:
                 if self.latentsync is None:
                     raise RuntimeError("LatentSync backend is not loaded")
@@ -1439,6 +1467,7 @@ class MuseTalkEngine:
             else:
                 logger.info("No speaking frames to infer; writing original frames")
 
+            _stage("inference")
             logger.info("Compositing frames with ffmpeg rawvideo pipe (libx264)")
             lipsync_frames = 0
             height, width = frame_list[0].shape[:2]
@@ -1662,11 +1691,14 @@ class MuseTalkEngine:
 
                         writer.write(combine_frame)
 
+            _stage("composite+encode")
             if audio_mux_source and has_audio_stream(audio_mux_source):
                 logger.info("Muxing input audio into final output: %s", audio_mux_source)
                 mux_video_with_source_audio(temp_vid_path, audio_mux_source, output_path)
             else:
                 shutil.move(temp_vid_path, output_path)
+
+            _stage("mux")
 
         result = {
             "output_path": output_path,
@@ -1677,4 +1709,11 @@ class MuseTalkEngine:
             "chunk_count": 1,
         }
         logger.info("Lip-sync completed: %s", result)
+        logger.info(
+            "[timing] TOTAL _run_lipsync_single: %.3fs (%d frames, %d speaking, %d lipsync)",
+            time.perf_counter() - _t_total,
+            video_num,
+            speaking_frames,
+            lipsync_frames,
+        )
         return result

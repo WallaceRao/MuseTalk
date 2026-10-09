@@ -1,4 +1,4 @@
-"""LatentSync 1.5 lipsync backend for speaking-gated segments.
+"""LatentSync 1.6 lipsync backend for speaking-gated segments.
 
 Keeps the V1 speaking / face / shot gate untouched. Only replaces MuseTalk
 frame generation: contiguous speaking runs are exported as short clips,
@@ -11,6 +11,7 @@ import logging
 import os
 import sys
 import tempfile
+import time
 from dataclasses import dataclass
 from typing import Dict, List, Optional, Sequence, Tuple
 
@@ -60,7 +61,7 @@ class LatentSyncPaths:
 
 
 class LatentSyncBackend:
-    """Load LatentSync 1.5 once and lipsync speaking clips."""
+    """Load LatentSync 1.6 once and lipsync speaking clips."""
 
     def __init__(
         self,
@@ -148,13 +149,14 @@ class LatentSyncBackend:
         self.weight_dtype = dtype
 
         logger.info(
-            "Loading LatentSync 1.5 on %s (res=%d, steps=%d, guidance=%.2f, fp16=%s)",
+            "Loading LatentSync 1.6 on %s (res=%d, steps=%d, guidance=%.2f, fp16=%s)",
             self.device,
             self.resolution,
             self.inference_steps,
             self.guidance_scale,
             is_fp16,
         )
+        _t_load = time.perf_counter()
 
         # FaceDetector resolves checkpoints/auxiliary relative to CWD.
         prev_cwd = os.getcwd()
@@ -178,17 +180,56 @@ class LatentSyncBackend:
                 num_frames=self.num_frames,
                 audio_feat_length=list(cfg.data.audio_feat_length),
             )
+            logger.info(
+                "[timing] latentsync whisper/audio_encoder load: %.3fs",
+                time.perf_counter() - _t_load,
+            )
+            _t_load = time.perf_counter()
 
             vae = AutoencoderKL.from_pretrained(self.paths.vae_path, torch_dtype=dtype)
             vae.config.scaling_factor = 0.18215
             vae.config.shift_factor = 0
+            logger.info(
+                "[timing] latentsync vae load: %.3fs", time.perf_counter() - _t_load
+            )
+            _t_load = time.perf_counter()
 
-            unet, _ = UNet3DConditionModel.from_pretrained(
+            unet, load_info = UNet3DConditionModel.from_pretrained(
                 OmegaConf.to_container(cfg.model),
                 self.paths.checkpoint,
                 device="cpu",
             )
             unet = unet.to(dtype=dtype)
+            logger.info(
+                "[timing] latentsync unet weight load (%s): %.3fs",
+                os.path.basename(os.path.dirname(self.paths.checkpoint)),
+                time.perf_counter() - _t_load,
+            )
+            # Guard against a config/weights mismatch (e.g. 1.6 weights loaded
+            # with the wrong resolution/arch yaml): surface any partial load.
+            try:
+                if isinstance(load_info, dict):
+                    missing = list(load_info.get("missing_keys", []))
+                    unexpected = list(load_info.get("unexpected_keys", []))
+                else:
+                    missing = list(getattr(load_info, "missing_keys", []) or [])
+                    unexpected = list(getattr(load_info, "unexpected_keys", []) or [])
+                if missing or unexpected:
+                    logger.warning(
+                        "LatentSync UNet load mismatch: missing=%d unexpected=%d "
+                        "(missing[:5]=%s unexpected[:5]=%s)",
+                        len(missing),
+                        len(unexpected),
+                        missing[:5],
+                        unexpected[:5],
+                    )
+                else:
+                    logger.info(
+                        "LatentSync UNet weights loaded clean (0 missing / 0 unexpected)"
+                    )
+            except Exception as exc:
+                logger.warning("Could not inspect LatentSync UNet load info: %s", exc)
+            _t_load = time.perf_counter()
 
             pipeline = LipsyncPipeline(
                 vae=vae,
@@ -196,6 +237,10 @@ class LatentSyncBackend:
                 unet=unet,
                 scheduler=scheduler,
             ).to(self.device)
+            logger.info(
+                "[timing] latentsync pipeline build+to(gpu): %.3fs",
+                time.perf_counter() - _t_load,
+            )
 
             # Warm FaceDetector once while CWD is LatentSync root so speaking
             # clips reuse InsightFace instead of reloading buffalo_l each run.
@@ -226,7 +271,7 @@ class LatentSyncBackend:
         finally:
             os.chdir(prev_cwd)
 
-        logger.info("LatentSync 1.5 models loaded")
+        logger.info("LatentSync 1.6 models loaded")
 
     def _get_face_detector(self):
         """Return the same InsightFace FaceDetector LatentSync affine uses."""
@@ -339,11 +384,19 @@ class LatentSyncBackend:
         primary_iou_min: float = 0.3,
     ) -> Dict[int, np.ndarray]:
         """Run LatentSync on contiguous speaking runs; return full BGR frames."""
+        _t_ff = time.perf_counter()
         faced_indices = self._filter_indices_with_faces(
             frame_list,
             infer_indices,
             coord_list=coord_list,
             primary_iou_min=primary_iou_min,
+        )
+        face_filter_sec = time.perf_counter() - _t_ff
+        logger.info(
+            "[timing] latentsync face pre-filter: %.3fs (%d/%d kept)",
+            face_filter_sec,
+            len(faced_indices),
+            len(infer_indices),
         )
         runs = contiguous_runs(faced_indices)
         if not runs:
@@ -358,6 +411,8 @@ class LatentSyncBackend:
         fps = float(fps) if fps and fps > 0 else 25.0
         os.makedirs(temp_dir, exist_ok=True)
         out: Dict[int, np.ndarray] = {}
+        io_sec = 0.0
+        infer_sec = 0.0
         logger.info(
             "LatentSync: %d speaking frames (%d after face filter) in %d contiguous run(s)",
             len(infer_indices),
@@ -374,6 +429,7 @@ class LatentSyncBackend:
             clip_out = os.path.join(clip_dir, "output.mp4")
 
             h, w = frame_list[start].shape[:2]
+            _t_io = time.perf_counter()
             with FFmpegRawVideoWriter(
                 clip_video, width=w, height=h, fps=float(fps), crf=18, preset="veryfast"
             ) as writer:
@@ -388,6 +444,7 @@ class LatentSyncBackend:
                 output_path=clip_audio,
                 sample_rate=16000,
             )
+            io_sec += time.perf_counter() - _t_io
 
             logger.info(
                 "LatentSync run %d/%d: frames [%d, %d] (%d @ %.3ffps)",
@@ -398,9 +455,11 @@ class LatentSyncBackend:
                 n,
                 fps,
             )
+            _t_inf = time.perf_counter()
             synced = self._infer_clip(
                 clip_video, clip_audio, clip_out, clip_dir, fps=fps, expect_frames=n
             )
+            infer_sec += time.perf_counter() - _t_inf
             if not synced:
                 logger.warning(
                     "LatentSync produced no frames for run [%d, %d]; keeping originals",
@@ -426,6 +485,15 @@ class LatentSyncBackend:
                     frame = cv2.resize(frame, (w, h), interpolation=cv2.INTER_LANCZOS4)
                 out[start + offset] = frame
 
+        logger.info(
+            "[timing] latentsync summary: face_filter=%.2fs clip_io=%.2fs "
+            "pipeline_infer=%.2fs (runs=%d, sync_frames=%d)",
+            face_filter_sec,
+            io_sec,
+            infer_sec,
+            len(runs),
+            len(out),
+        )
         return out
 
     def _infer_clip(
@@ -443,6 +511,7 @@ class LatentSyncBackend:
         try:
             # Keep whisper chunking on the same fps as the clip we wrote.
             video_fps = float(fps) if fps and fps > 0 else 25.0
+            _t_pipe = time.perf_counter()
             self.pipeline(
                 video_path=video_path,
                 audio_path=audio_path,
@@ -457,6 +526,13 @@ class LatentSyncBackend:
                 temp_dir=os.path.join(temp_dir, "pipeline_tmp"),
                 video_fps=video_fps,
             )
+            logger.info(
+                "[timing] latentsync pipeline (%d frames, res=%d, steps=%d): %.3fs",
+                expect_frames if expect_frames else -1,
+                self.resolution,
+                self.inference_steps,
+                time.perf_counter() - _t_pipe,
+            )
         except Exception:
             logger.exception("LatentSync inference failed for %s", video_path)
             return []
@@ -465,7 +541,13 @@ class LatentSyncBackend:
 
         if not os.path.isfile(video_out_path):
             return []
+        _t_dec = time.perf_counter()
         frames, _ = decode_video_frames(video_out_path)
+        logger.info(
+            "[timing] latentsync output decode (%d frames): %.3fs",
+            len(frames),
+            time.perf_counter() - _t_dec,
+        )
         if expect_frames is not None and len(frames) > int(expect_frames):
             frames = frames[: int(expect_frames)]
         return frames

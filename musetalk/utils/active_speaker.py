@@ -672,6 +672,61 @@ class VSDLMDetector:
             out[i] = best
         return out
 
+    def speaking_mask_op_mar(
+        self,
+        open_probs: Sequence[float],
+        mouth_mar_list: Sequence[Optional[float]],
+        coord_list: Sequence[Tuple[float, float, float, float]],
+        *,
+        open_threshold: float = 0.5,
+        mar_threshold: float = 0.12,
+        strong_open_threshold: float = 0.85,
+        fps: float = LR_ASD_FPS,
+        min_speak_duration_sec: float = 0.2,
+        shot_ids: Sequence[int] | None = None,
+    ) -> List[bool]:
+        """Per-frame mouth-open gate: ``op>=open_threshold AND mar>=mar_threshold``.
+
+        Industry-standard visual-speech gate for dubbing lip-sync: drive the
+        tracked face only while its mouth is genuinely open. Combining the
+        learned VSDLM open-prob with the geometric landmark MAR rescues the two
+        known failure modes of the old std/activity gate:
+          * VSDLM open saturates at ~1.0 for a sustained-open talker, so the
+            old open-prob-std gate wrongly suppressed real speakers (holes).
+          * A closed-but-smiling listener can read op~0.7 falsely, but its
+            landmark MAR stays low -> correctly suppressed.
+        Runs shorter than ``min_speak_duration_sec`` are dropped (per shot).
+        """
+        n = len(coord_list)
+        motion: List[bool] = []
+        for i in range(n):
+            if coord_list[i] == coord_placeholder:
+                motion.append(False)
+                continue
+            o = float("nan")
+            if i < len(open_probs):
+                ov = open_probs[i]
+                if ov is not None and np.isfinite(ov):
+                    o = float(ov)
+            m = None
+            if mouth_mar_list is not None and i < len(mouth_mar_list):
+                mv = mouth_mar_list[i]
+                if mv is not None and np.isfinite(mv):
+                    m = float(mv)
+            open_ok = np.isfinite(o) and o >= open_threshold
+            if m is not None:
+                mar_ok = m >= mar_threshold
+            else:
+                # DWPose mouth landmark unavailable: fall back to a strict
+                # open-prob bar so a missing MAR never suppresses the whole
+                # video (which would disable lipsync entirely).
+                mar_ok = np.isfinite(o) and o >= strong_open_threshold
+            motion.append(bool(open_ok and mar_ok))
+        fps = float(fps) if fps and fps > 0 else LR_ASD_FPS
+        duration = max(0.0, float(min_speak_duration_sec))
+        min_frames = max(1, int(round(duration * fps))) if duration > 0 else 1
+        return self._keep_runs_at_least(motion, min_frames, shot_ids=shot_ids)
+
     def speaking_mask_from_open_probs(
         self,
         open_probs: Sequence[float],
@@ -1077,6 +1132,8 @@ def expand_speaking_mask_within_vad(
     max_expand_sec: float = 3.0,
     shot_ids: Sequence[int] | None = None,
     valid_face: Sequence[bool] | None = None,
+    expand_gate: Sequence[bool] | None = None,
+    onset_lead_sec: float = 0.0,
 ) -> List[bool]:
     """Expand each speaking run toward its parent VAD segment.
 
@@ -1085,6 +1142,17 @@ def expand_speaking_mask_within_vad(
     - never past the parent VAD bounds
     - never across shot cuts when ``shot_ids`` is provided
     - frames without a valid face stay False when ``valid_face`` is set
+    - newly added frames must pass ``expand_gate`` (e.g. the primary face's
+      lip-motion mask) so we never bleed sync into pre-speech silence or
+      off-screen speech where the on-screen mouth is not moving. Frames that
+      were already speaking stay True regardless.
+    - ``onset_lead_sec`` recovers a genuine utterance **onset**: when a
+      speaking run essentially begins its parent VAD segment (``run_start -
+      vad_start <= onset_lead_sec``), the small gap from the VAD start up to
+      the run is filled on face-presence alone (VSDLM lip-motion lags the true
+      speech start by a few frames). This is backward-only and only at the VAD
+      segment start, so it never fills mid-segment off-screen gaps (e.g. a run
+      far from the VAD start) nor bleeds forward between runs.
 
     Runs with no containing VAD are left unchanged.
     """
@@ -1097,11 +1165,14 @@ def expand_speaking_mask_within_vad(
     max_pad = max(0, int(round(float(max_expand_sec) * fps)))
     if max_pad <= 0:
         return out
+    lead = max(0, int(round(float(onset_lead_sec or 0.0) * fps)))
 
     if shot_ids is not None and len(shot_ids) != n:
         raise ValueError("shot_ids length must match speaking_mask")
     if valid_face is not None and len(valid_face) != n:
         raise ValueError("valid_face length must match speaking_mask")
+    if expand_gate is not None and len(expand_gate) != n:
+        raise ValueError("expand_gate length must match speaking_mask")
 
     shot_range = _shot_ranges(shot_ids) if shot_ids is not None else {}
     runs = _contiguous_true_runs(speaking_mask, shot_ids=shot_ids)
@@ -1124,6 +1195,15 @@ def expand_speaking_mask_within_vad(
         for j in range(lo, hi + 1):
             if valid_face is not None and not valid_face[j]:
                 continue
+            if expand_gate is not None and not out[j]:
+                # Onset recovery: a run that essentially starts its VAD segment
+                # gets the [v0, rs) gap filled on face-presence only, because
+                # lip-motion detection lags real speech onset by a few frames.
+                # Backward-only and gated on proximity to the VAD start, so
+                # mid-segment / forward gaps still require the motion gate.
+                onset_fill = lead > 0 and j < rs and (rs - v0) <= lead
+                if not onset_fill and not expand_gate[j]:
+                    continue
             out[j] = True
     return out
 

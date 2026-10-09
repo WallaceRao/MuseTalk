@@ -691,6 +691,10 @@ def build_fused_speaking_mask(
     shot_cut_hist_threshold: float = 0.45,
     mouth_coord_list: Sequence[Tuple[float, float, float, float] | None] | None = None,
     mouth_mar_list: Sequence[float | None] | None = None,
+    speak_open_threshold: float = 0.5,
+    speak_mar_threshold: float = 0.12,
+    shot_fill_ratio: float = 0.35,
+    enable_shot_fill: bool = True,
 ) -> Tuple[List[bool], dict]:
     """VAD ∩ lip-motion on the MuseTalk primary face.
 
@@ -796,22 +800,24 @@ def build_fused_speaking_mask(
         primary_id if primary_id is not None else synthetic_primary_id
     )
 
-    # Primary visual gate: require lip motion. Sustained-open mouths may use
-    # softer open-std or landmark MAR std (open often saturates at ~1).
+    # Primary visual gate: drive the tracked face while its mouth is genuinely
+    # open. Per-frame ``op>=speak_open_threshold AND mar>=speak_mar_threshold``
+    # (see VSDLMDetector.speaking_mask_op_mar). This replaces the old std/
+    # activity gate that suppressed sustained-open talkers (op saturated ~1.0,
+    # std~0) while still firing on closed-but-smiling listeners.
     primary_visual = [False] * n
     if fallback_primary is not None and fallback_primary in open_probs:
         p_coords = coord_streams.get(fallback_primary) or [coord_placeholder] * n
         p_probs = open_probs[fallback_primary]
-        primary_visual, _ = vsdlm_detector.speaking_mask_from_open_probs(
+        primary_visual = vsdlm_detector.speaking_mask_op_mar(
             p_probs,
+            mouth_mar_list,
             p_coords,
+            open_threshold=speak_open_threshold,
+            mar_threshold=speak_mar_threshold,
             fps=fps,
             min_speak_duration_sec=loose_min_speak_duration_sec,
             shot_ids=shot_ids,
-            soft_open_mean=0.75,
-            soft_activity_threshold=0.05,
-            mouth_mar_list=mouth_mar_list,
-            mar_activity_threshold=vsdlm_detector.mar_activity_threshold,
         )
         primary_visual = list(primary_visual[:n])
 
@@ -838,6 +844,40 @@ def build_fused_speaking_mask(
             continue
         mask[i] = True
         primary_loose_frames += 1
+
+    # Utterance-level (per-shot) fill: dubbing drives the whole on-screen turn,
+    # not just the frames where the mouth happens to be open, so between-word
+    # dips don't leave holes. Within each (VAD ∩ shot) region, if the primary
+    # face is gated speaking for >= ``shot_fill_ratio`` of its face-present
+    # frames, fill the entire region. Keeping the decision per-shot means a VAD
+    # segment that cuts to a listener only fills the talker's shot (the 25s /
+    # 54s off-screen sub-shots stay suppressed).
+    if enable_shot_fill and shot_fill_ratio > 0:
+        i = 0
+        while i < n:
+            if not (vad_mask[i] and coord_list[i] != coord_placeholder):
+                i += 1
+                continue
+            cur_shot = int(shot_ids[i]) if shot_ids is not None else 0
+            j = i
+            face_frames = 0
+            speak_frames = 0
+            while (
+                j < n
+                and vad_mask[j]
+                and (int(shot_ids[j]) if shot_ids is not None else 0) == cur_shot
+            ):
+                if coord_list[j] != coord_placeholder:
+                    face_frames += 1
+                    if primary_visual[j]:
+                        speak_frames += 1
+                j += 1
+            if face_frames and (speak_frames / face_frames) >= shot_fill_ratio:
+                for k in range(i, j):
+                    if coord_list[k] != coord_placeholder:
+                        mask[k] = True
+                        primary_loose_frames += 1
+            i = j
 
     # Meta: other-face strict turns vs MuseTalk primary (diagnostics only).
     other_visual = [False] * n
@@ -876,6 +916,7 @@ def build_fused_speaking_mask(
         "vad_frames": sum(vad_mask),
         "other_speaker_frames": sum(other_visual),
         "other_visual": list(other_visual),
+        "primary_visual": list(primary_visual),
         "face_counts": [len(ft) for ft in frame_tracks],
         "raw_speaking_frames": sum(mask),
         "n_shots": n_shots,

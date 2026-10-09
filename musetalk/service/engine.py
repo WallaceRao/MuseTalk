@@ -108,6 +108,15 @@ class ServiceConfig:
     vad_url: str = "http://127.0.0.1:8061/vad_detect/"
     # Loose lip-motion duration for VAD∩VSDLM intersection (shorter than strict turns).
     vsdlm_loose_min_speak_duration_sec: float = 0.2
+    # Mouth-open speaking gate (industry dubbing ASD): a frame drives lipsync
+    # only when the tracked face's mouth is genuinely open, judged jointly by
+    # the VSDLM open-prob AND the geometric landmark MAR. op alone false-fires
+    # on closed-but-smiling listeners; mar alone is noisy under hands/hair.
+    vsdlm_speak_open_threshold: float = 0.5
+    vsdlm_speak_mar_threshold: float = 0.12
+    # Utterance-level fill: drive a whole (VAD∩shot) region when the primary
+    # face is gated speaking for >= this fraction of its face-present frames.
+    vsdlm_shot_fill_ratio: float = 0.35
     # Max time gap when assigning a VAD segment to a non-overlapping visual speaker.
     vad_assign_max_gap_sec: float = 0.5
     # SCRFD multi-face detect every N frames inside VAD×VSDLM fusion.
@@ -125,7 +134,14 @@ class ServiceConfig:
     # When VAD segments are available: expand each speaking run toward its
     # parent VAD by up to this many seconds per side. Clamped to the VAD
     # bounds and never across shot cuts. 0 = fall back to asd_mask_dilate.
-    asd_vad_expand_max_sec: float = 3.0
+    # Kept small (0.8s) so a real turn does not bleed backward into pre-speech
+    # silence / off-screen speech; expansion is also gated by primary_visual.
+    asd_vad_expand_max_sec: float = 0.8
+    # Short window adjacent to a real speaking run that is exempt from the
+    # primary_visual motion gate (still needs a face on screen): VSDLM lip
+    # motion lags true speech onset by a few frames, so this recovers the first
+    # ~0.5s of a genuine turn without re-opening long pre-speech/off-screen gaps.
+    asd_expand_onset_lead_sec: float = 0.5
     # Keep dilation / VAD expand inside the same camera shot (no cross-cut bleed).
     asd_dilate_respect_shots: bool = True
     # After speaking detection: lipsync whole shots that contain speaking
@@ -136,7 +152,8 @@ class ServiceConfig:
     lipsync_same_speaker_fill_shot: bool = True
     # When that shot also never shows >1 face, fill the whole shot including
     # silence so original talking mouths can close on silent reference audio.
-    lipsync_single_face_include_silence: bool = True
+    # Disabled: off-screen speech inside a single-face shot was being synced.
+    lipsync_single_face_include_silence: bool = False
     # Contiguous speaking (post-dilate) required inside a shot before expanding
     # lipsync to the whole shot. Filters brief VSDLM false positives
     # (e.g. ~19/33/46/54/93s). 1.5s is stricter than V1's 1.1s (drops ~20s FP expands).
@@ -760,6 +777,9 @@ class MuseTalkEngine:
                         shot_cut_hist_threshold=cfg.shot_cut_hist_threshold,
                         mouth_coord_list=mouth_coord_list,
                         mouth_mar_list=mouth_mar_list,
+                        speak_open_threshold=cfg.vsdlm_speak_open_threshold,
+                        speak_mar_threshold=cfg.vsdlm_speak_mar_threshold,
+                        shot_fill_ratio=cfg.vsdlm_shot_fill_ratio,
                     )
                     speaking_mask = speaking_mask[:video_num]
                     raw_speaking = int(fusion_meta.get("raw_speaking_frames", sum(speaking_mask)))
@@ -906,6 +926,19 @@ class MuseTalkEngine:
                     elif vad_segments:
                         vad_for_expand = list(vad_segments)
 
+                    # Only expand into frames where the primary face shows lip
+                    # motion, so backward/forward bleed never reaches pre-speech
+                    # silence or off-screen speech (e.g. ~25s / ~54s FPs).
+                    expand_gate = None
+                    if (
+                        fusion_meta is not None
+                        and fusion_meta.get("primary_visual") is not None
+                    ):
+                        expand_gate = [
+                            bool(x)
+                            for x in list(fusion_meta["primary_visual"])[:video_num]
+                        ]
+
                     before_expand = sum(speaking_mask)
                     if (
                         cfg.asd_vad_expand_max_sec > 0
@@ -918,6 +951,8 @@ class MuseTalkEngine:
                             max_expand_sec=cfg.asd_vad_expand_max_sec,
                             shot_ids=shot_ids,
                             valid_face=valid_face,
+                            expand_gate=expand_gate,
+                            onset_lead_sec=cfg.asd_expand_onset_lead_sec,
                         )
                         logger.info(
                             "VAD speaking expand: ±%.2fs (shot_aware=%s) → %d/%d (was %d)",

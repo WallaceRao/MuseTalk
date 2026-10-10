@@ -200,25 +200,56 @@ def paste_lipsync_in_bbox(
         return original_bgr.copy()
 
     rw, rh = x2e - x1e, y2e - y1e
-    mask = np.zeros((rh, rw), dtype=np.float32)
     feather = max(1, int(round(min(rw, rh) * float(feather_ratio))))
-    # Soft ellipse covering the expanded face box.
-    cv2.ellipse(
-        mask,
-        (rw // 2, rh // 2),
-        (max(1, rw // 2 - 1), max(1, rh // 2 - 1)),
-        0,
-        0,
-        360,
-        1.0,
-        -1,
-    )
-    if feather > 0:
-        k = feather * 2 + 1
-        mask = cv2.GaussianBlur(mask, (k, k), 0)
-        peak = float(mask.max()) if mask.size else 0.0
+    # Soft ellipse covering the expanded face box, feathered to blend the edge.
+    # The full-res Gaussian is O(k^2 * area) with k up to ~feather*2 (150+) and
+    # was the composite hotspot. The mask is a smooth low-frequency shape, so we
+    # build it at reduced resolution and bilinear-upscale: visually identical,
+    # ~10-25x cheaper. Small regions keep the exact full-res path.
+    max_side = max(rw, rh)
+    if max_side >= 128 and feather > 4:
+        scale = max(0.25, min(1.0, 96.0 / float(max_side)))
+        mw = max(1, int(round(rw * scale)))
+        mh = max(1, int(round(rh * scale)))
+        small = np.zeros((mh, mw), dtype=np.float32)
+        cv2.ellipse(
+            small,
+            (mw // 2, mh // 2),
+            (max(1, mw // 2 - 1), max(1, mh // 2 - 1)),
+            0,
+            0,
+            360,
+            1.0,
+            -1,
+        )
+        s_feather = max(1, int(round(feather * scale)))
+        sk = s_feather * 2 + 1
+        small = cv2.GaussianBlur(small, (sk, sk), 0)
+        peak = float(small.max()) if small.size else 0.0
         if peak > 1e-6:
-            mask /= peak
+            small /= peak
+        mask = cv2.resize(small, (rw, rh), interpolation=cv2.INTER_LINEAR).astype(
+            np.float32
+        )
+        np.clip(mask, 0.0, 1.0, out=mask)
+    else:
+        mask = np.zeros((rh, rw), dtype=np.float32)
+        cv2.ellipse(
+            mask,
+            (rw // 2, rh // 2),
+            (max(1, rw // 2 - 1), max(1, rh // 2 - 1)),
+            0,
+            0,
+            360,
+            1.0,
+            -1,
+        )
+        if feather > 0:
+            k = feather * 2 + 1
+            mask = cv2.GaussianBlur(mask, (k, k), 0)
+            peak = float(mask.max()) if mask.size else 0.0
+            if peak > 1e-6:
+                mask /= peak
 
     a = float(np.clip(alpha, 0.0, 1.0))
     if a < 0.999:

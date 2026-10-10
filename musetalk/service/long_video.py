@@ -622,13 +622,14 @@ class FFmpegRawVideoWriter:
             frame = frame.astype(np.uint8, copy=False)
         if not frame.flags["C_CONTIGUOUS"]:
             frame = np.ascontiguousarray(frame)
-        payload = frame.tobytes()
-        if len(payload) != self._frame_bytes:
+        if frame.nbytes != self._frame_bytes:
             raise ValueError(
-                f"Frame byte size mismatch: got {len(payload)}, expected {self._frame_bytes}"
+                f"Frame byte size mismatch: got {frame.nbytes}, expected {self._frame_bytes}"
             )
         try:
-            self._proc.stdin.write(payload)
+            # Write the buffer view directly: avoids a full ~2.7MB tobytes() copy
+            # per frame (BufferedWriter accepts any buffer-protocol object).
+            self._proc.stdin.write(memoryview(frame).cast("B"))
         except BrokenPipeError as exc:
             err = self._stderr_text()
             raise RuntimeError(f"ffmpeg stdin pipe broken while writing: {err or exc}") from exc

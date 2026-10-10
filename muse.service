@@ -13,6 +13,9 @@ Environment=PATH=/home/ubuntu/miniconda3/envs/heng/bin:/usr/local/ffmpeg/bin:/us
 Environment=LD_LIBRARY_PATH=/usr/local/ffmpeg/lib
 Environment=PYTHONUNBUFFERED=1
 Environment=CUDA_VISIBLE_DEVICES=0
+# VRAM: expandable segments let the caching allocator grow/reclaim in place,
+# cutting fragmentation and held-but-unused reservations on this shared GPU.
+Environment=PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
 # V2 default: LatentSync 1.5 lipsync; set musetalk to roll back to V1 generator
 Environment=MUSETALK_LIPSYNC_BACKEND=latentsync
 Environment=HF_ENDPOINT=https://hf-mirror.com

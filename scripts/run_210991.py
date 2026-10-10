@@ -17,7 +17,10 @@ D = "/opt/oss/wujiedub/video_translate/20261009/22/3"
 VIDEO = f"{D}/input_videos/e02f89df39.mp4"
 AUDIO = f"{D}/task/210991/translated_voice.wav"
 INTER = f"{D}/task/210991/intermediate_result.json"
-OUTPUT = os.path.abspath("verify_210991_16.mp4")
+OUTPUT = os.path.abspath("verify_210991_fast.mp4")
+_gres = int(os.environ.get("GEN_RES", "0") or 0)
+if _gres:
+    OUTPUT = os.path.abspath(f"verify_210991_res{_gres}.mp4")
 
 
 def build_vad(path):
@@ -41,6 +44,25 @@ def main():
     print(f"vad segments: {len(vad)}")
     cfg = ServiceConfig()
     cfg.lipsync_backend = os.environ["MUSETALK_LIPSYNC_BACKEND"]
+    _stream = os.environ.get("MUSETALK_STREAM_COMPOSITE")
+    if _stream is not None:
+        cfg.stream_composite = _stream.strip().lower() in {"1", "true", "yes", "on"}
+    _guid = os.environ.get("MUSETALK_LATENTSYNC_GUIDANCE")
+    if _guid is not None:
+        cfg.latentsync_guidance_scale = float(_guid)
+    _steps = os.environ.get("MUSETALK_LATENTSYNC_STEPS")
+    if _steps is not None:
+        cfg.latentsync_inference_steps = max(1, int(_steps))
+    _dc = os.environ.get("MUSETALK_LATENTSYNC_DEEPCACHE")
+    if _dc is not None:
+        cfg.latentsync_enable_deepcache = _dc.strip().lower() in {
+            "1",
+            "true",
+            "yes",
+            "on",
+        }
+    if _gres:
+        cfg.latentsync_gen_resolution = _gres
     engine = MuseTalkEngine(cfg)
     result = engine.run_lipsync(VIDEO, AUDIO, OUTPUT, vad_segments=vad)
     print("RESULT:", json.dumps({k: result[k] for k in

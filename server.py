@@ -37,6 +37,15 @@ def _load_service_config() -> ServiceConfig:
     if ls_guidance is not None:
         config.latentsync_guidance_scale = float(ls_guidance)
 
+    stream_composite = os.environ.get("MUSETALK_STREAM_COMPOSITE")
+    if stream_composite is not None:
+        config.stream_composite = stream_composite.strip().lower() in {
+            "1",
+            "true",
+            "yes",
+            "on",
+        }
+
     max_concurrent = os.environ.get("MUSETALK_MAX_CONCURRENT")
     if max_concurrent is not None:
         config.max_concurrent_requests = max(2, int(max_concurrent))

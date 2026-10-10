@@ -7,7 +7,7 @@ import sys
 import tempfile
 import time
 from dataclasses import dataclass
-from typing import List, Optional, Tuple
+from typing import List, Optional, Sequence, Tuple
 
 import cv2
 import numpy as np
@@ -224,8 +224,34 @@ class ServiceConfig:
     latentsync_ckpt: str = "./models/latentsync16/latentsync_unet.pt"
     latentsync_whisper: str = "./models/latentsync16/whisper/tiny.pt"
     latentsync_vae: str = "./models/sd-vae"
-    latentsync_inference_steps: int = 30
+    # Inference-acceleration knobs (LatentSync 1.6 baseline was steps=30/guidance=1.5).
+    # steps 30->20 is LatentSync's own default (~1.5x). guidance_scale<=1.0 disables
+    # classifier-free guidance (batch=1/step, ~2x faster) but on real dubbing content
+    # the mouth is audio-constrained so CFG buys little visually (measured: 1.0->1.5 is
+    # +21% wall, PSNR~51 vs 1.0). Kept at 1.5 to match LatentSync's intended CFG.
+    latentsync_inference_steps: int = 20
     latentsync_guidance_scale: float = 1.5
+    # Enable TF32 + cuDNN autotuner for the (mostly fixed) 16-frame chunk shapes.
+    latentsync_fastpath: bool = True
+    # torch.compile the UNet. Disabled by default: with the variable last-chunk
+    # frame counts + graph breaks in LatentSync's 3D attention it triggers a
+    # recompilation storm that is far slower than eager here. Kept as opt-in.
+    latentsync_compile_unet: bool = False
+    # Generation resolution for the face crop. 0 = use the model's trained
+    # resolution (512 for 1.6). Keep 0/512: the pipeline code itself is
+    # resolution-agnostic (fully-conv UNet + dynamic-seq attention, mask/affine
+    # parameterized by size), but the 1.6 weights are trained only at 512, so any
+    # other size is out-of-distribution and yields structurally corrupted faces
+    # (verified: 384 -> garbage). The valid lower-res speed path is to swap to the
+    # 256-trained 1.5 checkpoint, not to force 1.6 off 512.
+    latentsync_gen_resolution: int = 0
+    # x264 preset for the transient per-run clip mp4s the LatentSync pipeline
+    # round-trips (input/output). Discarded after use, so ultrafast (crf kept).
+    latentsync_clip_preset: str = "ultrafast"
+    # x264 preset for the FINAL delivered video. Encode is only ~3s for a full
+    # 2257-frame 720x1280 clip on this box, so it is NOT the bottleneck; keep the
+    # balanced veryfast (superfast/ultrafast just bloat the file for ~1s).
+    output_x264_preset: str = "veryfast"
     latentsync_enable_deepcache: bool = True
     latentsync_seed: int = 1247
     # Drop LatentSync frames whose InsightFace box does not match MuseTalk primary.
@@ -238,6 +264,12 @@ class ServiceConfig:
     latentsync_paste_primary_only: bool = True
     latentsync_paste_expand_ratio: float = 0.35
     latentsync_paste_feather_ratio: float = 0.2
+    # Overlap the CPU composite+encode with GPU generation: composite each
+    # LatentSync run on a background writer thread while the next run is still
+    # being generated. Per-run blend alphas are computed on the run's own isolated
+    # active block, which is byte-identical to the global ramp (runs are separated
+    # by >=1 non-speaking frame). Kill-switch: set False to restore the serial path.
+    stream_composite: bool = True
 
 
 class MuseTalkEngine:
@@ -386,6 +418,10 @@ class MuseTalkEngine:
                 enable_deepcache=cfg.latentsync_enable_deepcache,
                 seed=cfg.latentsync_seed,
                 use_float16=cfg.use_float16,
+                fastpath=cfg.latentsync_fastpath,
+                compile_unet=cfg.latentsync_compile_unet,
+                gen_resolution=cfg.latentsync_gen_resolution,
+                clip_preset=cfg.latentsync_clip_preset,
             )
             logger.info(
                 "[timing] latentsync backend load: %.3fs",
@@ -650,6 +686,163 @@ class MuseTalkEngine:
         logger.info("Chunked lip-sync completed: %s", result)
         return result
 
+    def _latentsync_streaming(
+        self,
+        *,
+        cfg: "ServiceConfig",
+        frame_list: List[np.ndarray],
+        coord_list: Sequence,
+        coord_placeholder,
+        mouth_vis_list: Optional[List[float]],
+        audio_path: str,
+        infer_indices: List[int],
+        fps: float,
+        ls_temp_dir: str,
+        height: int,
+        width: int,
+        temp_vid_path: str,
+    ) -> "tuple[dict[int, np.ndarray], int]":
+        """Generate LatentSync runs on this thread while compositing on a worker.
+
+        Each finished run is handed to a background thread through a queue; the
+        worker pastes/blends that run into the output ffmpeg pipe and keeps
+        writing frames in strict global order (gaps before a run and the trailing
+        tail are emitted as originals). Because runs are separated by >=1
+        non-speaking frame, the per-run ``compute_segment_blend_alphas`` on the
+        run's own isolated active block is byte-identical to the global ramp, and
+        the per-frame paste/occlusion logic is copied verbatim from the serial
+        path, so frame counts and gates are unchanged.
+        """
+        import queue
+        import threading
+
+        video_num = len(frame_list)
+        writer = FFmpegRawVideoWriter(
+            temp_vid_path,
+            width=width,
+            height=height,
+            fps=float(fps),
+            crf=18,
+            preset=cfg.output_x264_preset,
+        )
+        writer.open()
+        q: "queue.Queue" = queue.Queue()
+        cursor = 0
+        lipsync_frames = 0
+        worker_err: dict = {"exc": None}
+
+        def _write_frame(i: int, synced: Optional[np.ndarray], alpha_base: float) -> None:
+            nonlocal lipsync_frames
+            ori_frame = frame_list[i]
+            if synced is None:
+                writer.write(ori_frame)
+                return
+            alpha = float(alpha_base)
+            if (
+                cfg.lipsync_mouth_occlusion_gate
+                and mouth_vis_list is not None
+                and i < len(mouth_vis_list)
+            ):
+                alpha *= mouth_occlusion_blend_weight(
+                    mouth_vis_list[i],
+                    clear_below=cfg.lipsync_mouth_vis_clear,
+                    full_above=cfg.lipsync_mouth_vis_full,
+                )
+            if alpha <= 0.001:
+                writer.write(ori_frame)
+                return
+            combine_frame = synced
+            if combine_frame.shape[0] != height or combine_frame.shape[1] != width:
+                combine_frame = cv2.resize(
+                    combine_frame, (width, height), interpolation=cv2.INTER_LANCZOS4
+                )
+            bbox = coord_list[i] if i < len(coord_list) else None
+            if (
+                cfg.latentsync_paste_primary_only
+                and bbox is not None
+                and bbox != coord_placeholder
+            ):
+                paste_bbox = list(bbox)
+                if cfg.version == "v15":
+                    paste_bbox[3] = min(
+                        float(paste_bbox[3]) + cfg.extra_margin,
+                        float(height),
+                    )
+                combine_frame = paste_lipsync_in_bbox(
+                    ori_frame,
+                    combine_frame,
+                    paste_bbox,
+                    expand_ratio=cfg.latentsync_paste_expand_ratio,
+                    feather_ratio=cfg.latentsync_paste_feather_ratio,
+                    alpha=alpha,
+                )
+            elif alpha < 0.999:
+                combine_frame = blend_frames(ori_frame, combine_frame, alpha)
+            lipsync_frames += 1
+            writer.write(combine_frame)
+
+        def _worker() -> None:
+            nonlocal cursor
+            try:
+                while True:
+                    item = q.get()
+                    if item is None:
+                        break
+                    start, end, run_frames = item
+                    while cursor < start:
+                        writer.write(frame_list[cursor])
+                        cursor += 1
+                    mask = [j in run_frames for j in range(start, end + 1)]
+                    alphas = compute_segment_blend_alphas(
+                        mask, ramp_frames=cfg.blend_ramp_frames
+                    )
+                    for i in range(start, end + 1):
+                        k = i - start
+                        alpha_base = alphas[k] if k < len(alphas) else 1.0
+                        _write_frame(i, run_frames.get(i), alpha_base)
+                        cursor += 1
+                while cursor < video_num:
+                    writer.write(frame_list[cursor])
+                    cursor += 1
+            except Exception as exc:  # pragma: no cover - defensive
+                worker_err["exc"] = exc
+            finally:
+                try:
+                    if worker_err["exc"] is not None:
+                        writer.abort()
+                    else:
+                        writer.close()
+                except Exception:
+                    pass
+
+        worker = threading.Thread(target=_worker, daemon=True)
+        worker.start()
+        full_frame_by_index: dict = {}
+        try:
+            full_frame_by_index = self.latentsync.lipsync_indices(
+                frame_list=frame_list,
+                audio_path=audio_path,
+                infer_indices=infer_indices,
+                fps=float(fps),
+                temp_dir=ls_temp_dir,
+                coord_list=coord_list,
+                primary_iou_min=cfg.latentsync_primary_iou_min,
+                stream_cb=lambda s, e, rf: q.put((s, e, rf)),
+            )
+        finally:
+            q.put(None)
+            worker.join()
+        if worker_err["exc"] is not None:
+            raise worker_err["exc"]
+        logger.info(
+            "[streaming] LatentSync composite overlapped with generation: "
+            "synced=%d/%d lipsync=%d",
+            len(full_frame_by_index),
+            video_num,
+            lipsync_frames,
+        )
+        return full_frame_by_index, lipsync_frames
+
     @torch.no_grad()
     def _run_lipsync_single(
         self,
@@ -869,6 +1062,7 @@ class MuseTalkEngine:
                     raw_speaking = sum(speaking_mask)
 
                 # Gender gate on pre-dilate speaking runs (before VAD expand/dilate).
+                _t_gate_gender = time.perf_counter()
                 vad_for_gender = None
                 if fusion_meta is not None and fusion_meta.get("vad_segments"):
                     vad_for_gender = list(fusion_meta["vad_segments"])
@@ -923,6 +1117,10 @@ class MuseTalkEngine:
                                 "VAD gender present but FairFace unavailable; "
                                 "skipping gender gate"
                             )
+
+                logger.info(
+                    "[timing] gate.gender: %.3fs", time.perf_counter() - _t_gate_gender
+                )
 
                 if cfg.asd_vad_expand_max_sec > 0 or cfg.asd_mask_dilate > 0:
                     valid_face = [b != coord_placeholder for b in coord_list]
@@ -1247,6 +1445,7 @@ class MuseTalkEngine:
             min_area = cfg.min_face_area_ratio * float(frame_w0 * frame_h0)
             mouth_vis_list = None
 
+            _t_gate_yaw = time.perf_counter()
             if cfg.lipsync_yaw_gate and speaking_mask is not None and sum(speaking_mask) > 0:
                 yaw_estimator = self._get_yaw_estimator()
                 if yaw_estimator is None:
@@ -1316,7 +1515,10 @@ class MuseTalkEngine:
                             yaw_meta["reentered_on"],
                         )
 
+            logger.info("[timing] gate.yaw: %.3fs", time.perf_counter() - _t_gate_yaw)
+
             mouth_vis_list = None
+            _t_gate_mouth = time.perf_counter()
             if (
                 cfg.lipsync_mouth_occlusion_gate
                 and speaking_mask is not None
@@ -1384,6 +1586,10 @@ class MuseTalkEngine:
                             ),
                         )
 
+            logger.info(
+                "[timing] gate.mouth_occlusion: %.3fs", time.perf_counter() - _t_gate_mouth
+            )
+
             for i in range(video_num):
                 if not speaking_mask[i]:
                     continue
@@ -1404,19 +1610,40 @@ class MuseTalkEngine:
 
             res_by_index: dict[int, np.ndarray] = {}
             full_frame_by_index: dict[int, np.ndarray] = {}
+            lipsync_frames = 0
+            height, width = frame_list[0].shape[:2]
+            temp_vid_path = os.path.join(temp_dir, f"temp_{output_basename}.mp4")
+            _stream_composited = False
             _stage("speaking-gate")
             if infer_indices and self._use_latentsync:
                 if self.latentsync is None:
                     raise RuntimeError("LatentSync backend is not loaded")
-                full_frame_by_index = self.latentsync.lipsync_indices(
-                    frame_list=frame_list,
-                    audio_path=audio_path,
-                    infer_indices=infer_indices,
-                    fps=float(fps),
-                    temp_dir=os.path.join(temp_dir, "latentsync"),
-                    coord_list=coord_list,
-                    primary_iou_min=cfg.latentsync_primary_iou_min,
-                )
+                if cfg.stream_composite:
+                    full_frame_by_index, lipsync_frames = self._latentsync_streaming(
+                        cfg=cfg,
+                        frame_list=frame_list,
+                        coord_list=coord_list,
+                        coord_placeholder=coord_placeholder,
+                        mouth_vis_list=mouth_vis_list,
+                        audio_path=audio_path,
+                        infer_indices=infer_indices,
+                        fps=float(fps),
+                        ls_temp_dir=os.path.join(temp_dir, "latentsync"),
+                        height=height,
+                        width=width,
+                        temp_vid_path=temp_vid_path,
+                    )
+                    _stream_composited = True
+                else:
+                    full_frame_by_index = self.latentsync.lipsync_indices(
+                        frame_list=frame_list,
+                        audio_path=audio_path,
+                        infer_indices=infer_indices,
+                        fps=float(fps),
+                        temp_dir=os.path.join(temp_dir, "latentsync"),
+                        coord_list=coord_list,
+                        primary_iou_min=cfg.latentsync_primary_iou_min,
+                    )
             elif infer_indices:
                 logger.info(
                     "Encoding latents for %d speaking frames (skipped %d)",
@@ -1469,13 +1696,10 @@ class MuseTalkEngine:
 
             _stage("inference")
             logger.info("Compositing frames with ffmpeg rawvideo pipe (libx264)")
-            lipsync_frames = 0
-            height, width = frame_list[0].shape[:2]
-            temp_vid_path = os.path.join(temp_dir, f"temp_{output_basename}.mp4")
 
             # LatentSync re-detects the largest face per frame; paste only the
             # MuseTalk primary bbox so secondary faces never flash.
-            if self._use_latentsync:
+            if self._use_latentsync and not _stream_composited:
                 active_mask = [i in full_frame_by_index for i in range(video_num)]
                 blend_alphas = compute_segment_blend_alphas(
                     active_mask, ramp_frames=cfg.blend_ramp_frames
@@ -1495,7 +1719,7 @@ class MuseTalkEngine:
                     height=height,
                     fps=float(fps),
                     crf=18,
-                    preset="veryfast",
+                    preset=cfg.output_x264_preset,
                 ) as writer:
                     for i in tqdm(range(video_num)):
                         ori_frame = frame_list[i]
@@ -1546,7 +1770,7 @@ class MuseTalkEngine:
                             combine_frame = blend_frames(ori_frame, combine_frame, alpha)
                         lipsync_frames += 1
                         writer.write(combine_frame)
-            else:
+            elif not self._use_latentsync:
                 # Batch CodeFormer restore before the per-frame blend loop.
                 # Stride reuse must stay on the same face track: if bbox IoU drops or
                 # speaking frames are far apart, force a fresh restore (never paste the
@@ -1615,7 +1839,7 @@ class MuseTalkEngine:
                     height=height,
                     fps=float(fps),
                     crf=18,
-                    preset="veryfast",
+                    preset=cfg.output_x264_preset,
                 ) as writer:
                     active_mask = [i in restored_by_index for i in range(video_num)]
                     blend_alphas = compute_segment_blend_alphas(

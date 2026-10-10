@@ -13,7 +13,7 @@ import sys
 import tempfile
 import time
 from dataclasses import dataclass
-from typing import Dict, List, Optional, Sequence, Tuple
+from typing import Callable, Dict, List, Optional, Sequence, Tuple
 
 import cv2
 import numpy as np
@@ -49,6 +49,82 @@ def contiguous_runs(indices: Sequence[int]) -> List[Tuple[int, int]]:
     return runs
 
 
+def _bbox_iou(a, b) -> float:
+    """IoU of two (x1,y1,x2,y2) boxes; 0.0 for None/placeholder/degenerate."""
+    try:
+        ax1, ay1, ax2, ay2 = (float(a[0]), float(a[1]), float(a[2]), float(a[3]))
+        bx1, by1, bx2, by2 = (float(b[0]), float(b[1]), float(b[2]), float(b[3]))
+    except (TypeError, ValueError, IndexError):
+        return 0.0
+    if ax2 <= ax1 or ay2 <= ay1 or bx2 <= bx1 or by2 <= by1:
+        return 0.0
+    iw = max(0.0, min(ax2, bx2) - max(ax1, bx1))
+    ih = max(0.0, min(ay2, by2) - max(ay1, by1))
+    inter = iw * ih
+    union = (ax2 - ax1) * (ay2 - ay1) + (bx2 - bx1) * (by2 - by1) - inter
+    return inter / union if union > 0 else 0.0
+
+
+def cleanup_runs(
+    runs: List[Tuple[int, int]],
+    *,
+    min_run_frames: int,
+    merge_gap_frames: int,
+    coord_list: Optional[Sequence] = None,
+    shot_ids: Optional[Sequence[int]] = None,
+    merge_iou_min: float = 0.5,
+) -> List[Tuple[int, int]]:
+    """Merge short gaps then drop micro-runs to cut per-run fixed overhead.
+
+    Two morphological passes over inclusive (start, end) runs:
+      1. close: join neighbours separated by <= ``merge_gap_frames`` non-speaking
+         frames, but ONLY when the two runs stay inside the same camera shot.
+         A LatentSync clip is denoised as ONE face across its whole span, so
+         stitching a shot cut / person change into a single run drives the wrong
+         mouth across the cut. ``shot_ids`` (from detect_shot_ids, HSV-histogram
+         + grayscale MAE) is the authoritative gate and is robust to same-framing
+         cuts where bbox IoU would stay high; when it is unavailable we fall back
+         to a bbox-IoU continuity heuristic over ``coord_list``.
+      2. open: drop any run still shorter than ``min_run_frames`` (isolated
+         micro-segments like a 3-frame word tail -> kept as the original plate).
+    Set both knobs to 0 to disable and reproduce the raw contiguous-run layout.
+    """
+    if not runs:
+        return runs
+    merge_gap = max(0, int(merge_gap_frames))
+    min_len = max(0, int(min_run_frames))
+    if merge_gap == 0 and min_len <= 1:
+        return list(runs)
+
+    def _same_face(prev_end: int, next_start: int) -> bool:
+        # Primary gate: both boundary frames must be in the same shot. Unknown
+        # shot id (out of range) -> treat as different to stay safe.
+        if shot_ids is not None:
+            a = shot_ids[prev_end] if 0 <= prev_end < len(shot_ids) else None
+            b = shot_ids[next_start] if 0 <= next_start < len(shot_ids) else None
+            return a is not None and a == b
+        # Fallback (no shot info): keep the old (unguarded) temporal-only merge
+        # when there is no face data or a non-positive threshold.
+        if coord_list is None or merge_iou_min <= 0:
+            return True
+        a = coord_list[prev_end] if 0 <= prev_end < len(coord_list) else None
+        b = coord_list[next_start] if 0 <= next_start < len(coord_list) else None
+        return _bbox_iou(a, b) >= merge_iou_min
+
+    merged: List[List[int]] = [[int(runs[0][0]), int(runs[0][1])]]
+    for s, e in runs[1:]:
+        s, e = int(s), int(e)
+        if (
+            s - merged[-1][1] - 1 <= merge_gap
+            and _same_face(merged[-1][1], s)
+        ):
+            merged[-1][1] = max(merged[-1][1], e)
+        else:
+            merged.append([s, e])
+    kept = [(s, e) for (s, e) in merged if (e - s + 1) >= min_len]
+    return kept
+
+
 @dataclass
 class LatentSyncPaths:
     repo_root: str
@@ -77,6 +153,10 @@ class LatentSyncBackend:
         enable_deepcache: bool = True,
         seed: int = 1247,
         use_float16: bool = True,
+        fastpath: bool = True,
+        compile_unet: bool = False,
+        gen_resolution: Optional[int] = None,
+        clip_preset: str = "ultrafast",
     ):
         self.device = device
         self.inference_steps = int(inference_steps)
@@ -84,6 +164,15 @@ class LatentSyncBackend:
         self.enable_deepcache = bool(enable_deepcache)
         self.seed = int(seed)
         self.use_float16 = bool(use_float16)
+        self.fastpath = bool(fastpath)
+        self.compile_unet = bool(compile_unet)
+        # Optional override of the face-crop generation resolution; None/0 keeps
+        # the model's trained resolution (512). Lower = big speedup, lower quality.
+        self.gen_resolution = int(gen_resolution) if gen_resolution else None
+        # x264 preset for the transient per-run clip mp4s (input/output) that the
+        # pipeline round-trips. These files are discarded, so use the fastest
+        # preset; crf is kept low so face quality fed into the UNet is preserved.
+        self.clip_preset = str(clip_preset)
 
         repo_root = os.path.abspath(repo_root)
         if not os.path.isdir(repo_root):
@@ -134,6 +223,14 @@ class LatentSyncBackend:
         from latentsync.models.unet import UNet3DConditionModel
         from latentsync.pipelines.lipsync_pipeline import LipsyncPipeline
         from latentsync.whisper.audio2feature import Audio2Feature
+
+        if self.fastpath and self.device.type == "cuda":
+            # Speaking clips are near-fixed 16-frame shapes, so the cuDNN
+            # autotuner + TF32 pay off across the many denoise steps.
+            torch.backends.cuda.matmul.allow_tf32 = True
+            torch.backends.cudnn.allow_tf32 = True
+            torch.backends.cudnn.benchmark = True
+            logger.info("LatentSync fastpath enabled: TF32 + cudnn.benchmark")
 
         cfg = OmegaConf.load(self.paths.unet_config)
         self.config = cfg
@@ -189,6 +286,22 @@ class LatentSyncBackend:
             vae = AutoencoderKL.from_pretrained(self.paths.vae_path, torch_dtype=dtype)
             vae.config.scaling_factor = 0.18215
             vae.config.shift_factor = 0
+            # VRAM: decode per-sample slices to cap the VAE activation peak.
+            # Slicing is lossless (2D VAE is per-sample; measured <=3/255 and
+            # frame-uniform). Do NOT enable tiling here: this sd-vae has
+            # config.sample_size=256 -> tile_latent_min_size=32, so our 64x64
+            # latent (512 output) WOULD trigger tiled_decode and its tile-blend
+            # seams introduce visible patches/flicker (measured ~26/255). Keep
+            # tiling explicitly off. Kill-switch: MUSETALK_LATENTSYNC_VAE_SLICING=0.
+            if os.environ.get("MUSETALK_LATENTSYNC_VAE_SLICING", "1") != "0":
+                try:
+                    if hasattr(vae, "enable_slicing"):
+                        vae.enable_slicing()
+                    logger.info("LatentSync VAE slicing enabled (tiling kept off)")
+                except Exception as exc:
+                    logger.warning("LatentSync VAE slicing disabled: %s", exc)
+            if hasattr(vae, "disable_tiling"):
+                vae.disable_tiling()
             logger.info(
                 "[timing] latentsync vae load: %.3fs", time.perf_counter() - _t_load
             )
@@ -263,6 +376,16 @@ class LatentSyncBackend:
                     logger.info("LatentSync DeepCache enabled")
                 except Exception as exc:
                     logger.warning("DeepCache disabled: %s", exc)
+
+            if self.compile_unet:
+                try:
+                    # dynamic=True lets one compilation serve the variable
+                    # last-chunk frame counts without recompiling per shape.
+                    pipeline.unet = torch.compile(unet, dynamic=True)
+                    logger.info("LatentSync UNet torch.compile enabled (dynamic)")
+                except Exception as exc:
+                    pipeline.unet = unet
+                    logger.warning("LatentSync torch.compile disabled: %s", exc)
 
             if self.seed >= 0:
                 set_seed(self.seed)
@@ -382,8 +505,15 @@ class LatentSyncBackend:
         temp_dir: str,
         coord_list: Optional[Sequence] = None,
         primary_iou_min: float = 0.3,
+        stream_cb: Optional[Callable[[int, int, Dict[int, np.ndarray]], None]] = None,
     ) -> Dict[int, np.ndarray]:
-        """Run LatentSync on contiguous speaking runs; return full BGR frames."""
+        """Run LatentSync on contiguous speaking runs; return full BGR frames.
+
+        If ``stream_cb`` is provided, it is invoked right after each run finishes
+        with ``(start, end, run_frames)`` so the caller can composite that run
+        while the next run's GPU inference is still running (CPU/GPU overlap).
+        The full ``out`` dict is still returned for backward compatibility.
+        """
         _t_ff = time.perf_counter()
         faced_indices = self._filter_indices_with_faces(
             frame_list,
@@ -399,6 +529,52 @@ class LatentSyncBackend:
             len(infer_indices),
         )
         runs = contiguous_runs(faced_indices)
+        # Merge micro gaps + drop tiny runs: each pipeline call carries ~2-3s of
+        # step-independent overhead, so 3-6 frame bursts are costly and can read
+        # as a stray mouth flap. Merging is shot-gated (both boundary frames must
+        # fall in the same camera shot per detect_shot_ids) so a cut / person
+        # change inside the gap is NOT stitched into one clip, which would drive
+        # the wrong mouth across the cut. Kill-switches (0 disables the pass):
+        #   MUSETALK_LATENTSYNC_MIN_RUN_FRAMES   (default 6)
+        #   MUSETALK_LATENTSYNC_MERGE_GAP_FRAMES (default 4)
+        #   MUSETALK_LATENTSYNC_MERGE_USE_SHOT   (default 1; 0 -> bbox-IoU gate)
+        #   MUSETALK_LATENTSYNC_MERGE_IOU_MIN    (fallback gate, default 0.5)
+        _min_run = int(os.environ.get("MUSETALK_LATENTSYNC_MIN_RUN_FRAMES", "6") or 0)
+        _merge_gap = int(os.environ.get("MUSETALK_LATENTSYNC_MERGE_GAP_FRAMES", "4") or 0)
+        _merge_iou = float(os.environ.get("MUSETALK_LATENTSYNC_MERGE_IOU_MIN", "0.5") or 0)
+        _use_shot = os.environ.get("MUSETALK_LATENTSYNC_MERGE_USE_SHOT", "1") != "0"
+        shot_ids: Optional[List[int]] = None
+        if _use_shot and _merge_gap > 0 and len(runs) > 1:
+            try:
+                from musetalk.utils.active_speaker import detect_shot_ids
+
+                shot_ids = detect_shot_ids(frame_list)
+            except Exception as exc:  # pragma: no cover - defensive
+                logger.warning("LatentSync merge shot-gate unavailable (%s); using bbox", exc)
+                shot_ids = None
+        _raw_frames = sum(e - s + 1 for s, e in runs)
+        _n_raw = len(runs)
+        runs = cleanup_runs(
+            runs,
+            min_run_frames=_min_run,
+            merge_gap_frames=_merge_gap,
+            coord_list=coord_list,
+            shot_ids=shot_ids,
+            merge_iou_min=_merge_iou,
+        )
+        _kept_frames = sum(e - s + 1 for s, e in runs)
+        if _kept_frames != _raw_frames or len(runs) != _n_raw:
+            logger.info(
+                "LatentSync run cleanup: %d run(s)/%d frames -> %d run(s)/%d frames "
+                "(min_run=%d merge_gap=%d gate=%s)",
+                _n_raw,
+                _raw_frames,
+                len(runs),
+                _kept_frames,
+                _min_run,
+                _merge_gap,
+                ("shot" if shot_ids is not None else f"iou{_merge_iou:.2f}"),
+            )
         if not runs:
             if infer_indices:
                 logger.warning(
@@ -431,7 +607,7 @@ class LatentSyncBackend:
             h, w = frame_list[start].shape[:2]
             _t_io = time.perf_counter()
             with FFmpegRawVideoWriter(
-                clip_video, width=w, height=h, fps=float(fps), crf=18, preset="veryfast"
+                clip_video, width=w, height=h, fps=float(fps), crf=18, preset=self.clip_preset
             ) as writer:
                 for i in range(start, end + 1):
                     writer.write(frame_list[i])
@@ -479,11 +655,15 @@ class LatentSyncBackend:
                     n,
                     use_n,
                 )
+            run_frames: Dict[int, np.ndarray] = {}
             for offset in range(use_n):
                 frame = synced[offset]
                 if frame.shape[0] != h or frame.shape[1] != w:
                     frame = cv2.resize(frame, (w, h), interpolation=cv2.INTER_LANCZOS4)
-                out[start + offset] = frame
+                run_frames[start + offset] = frame
+            out.update(run_frames)
+            if stream_cb is not None:
+                stream_cb(start, end, run_frames)
 
         logger.info(
             "[timing] latentsync summary: face_filter=%.2fs clip_io=%.2fs "
@@ -494,6 +674,12 @@ class LatentSyncBackend:
             len(runs),
             len(out),
         )
+        # VRAM: release all GPU-side cache blocks once generation is done so the
+        # CPU composite/encode/mux phases (and idle time between requests) do not
+        # keep the allocator holding memory on this shared GPU.
+        if os.environ.get("MUSETALK_LATENTSYNC_EMPTY_CACHE", "1") != "0" \
+                and torch.cuda.is_available():
+            torch.cuda.empty_cache()
         return out
 
     def _infer_clip(
@@ -511,6 +697,7 @@ class LatentSyncBackend:
         try:
             # Keep whisper chunking on the same fps as the clip we wrote.
             video_fps = float(fps) if fps and fps > 0 else 25.0
+            gen_res = self.gen_resolution or self.resolution
             _t_pipe = time.perf_counter()
             self.pipeline(
                 video_path=video_path,
@@ -520,8 +707,8 @@ class LatentSyncBackend:
                 num_inference_steps=self.inference_steps,
                 guidance_scale=self.guidance_scale,
                 weight_dtype=self.weight_dtype,
-                width=self.resolution,
-                height=self.resolution,
+                width=gen_res,
+                height=gen_res,
                 mask_image_path=self.paths.mask_image,
                 temp_dir=os.path.join(temp_dir, "pipeline_tmp"),
                 video_fps=video_fps,
@@ -529,7 +716,7 @@ class LatentSyncBackend:
             logger.info(
                 "[timing] latentsync pipeline (%d frames, res=%d, steps=%d): %.3fs",
                 expect_frames if expect_frames else -1,
-                self.resolution,
+                gen_res,
                 self.inference_steps,
                 time.perf_counter() - _t_pipe,
             )
@@ -538,6 +725,13 @@ class LatentSyncBackend:
             return []
         finally:
             os.chdir(prev_cwd)
+            # VRAM: hand this run's freed caching-allocator segments back to the
+            # driver before the next run so our held peak does not ratchet up
+            # (matters on this shared/multi-tenant GPU). Kill-switch env:
+            # MUSETALK_LATENTSYNC_EMPTY_CACHE=0.
+            if os.environ.get("MUSETALK_LATENTSYNC_EMPTY_CACHE", "1") != "0" \
+                    and torch.cuda.is_available():
+                torch.cuda.empty_cache()
 
         if not os.path.isfile(video_out_path):
             return []

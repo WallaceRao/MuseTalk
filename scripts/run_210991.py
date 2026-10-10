@@ -4,6 +4,7 @@ Dumps the final per-frame speaking mask for analysis."""
 import os
 import sys
 import json
+import time
 import subprocess
 
 os.environ.setdefault("MUSETALK_LIPSYNC_BACKEND", "latentsync")
@@ -13,6 +14,7 @@ sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), "..")
 from musetalk.utils.vad_client import VadSegment
 from musetalk.service.logging_setup import setup_logging
 from musetalk.service.engine import ServiceConfig, MuseTalkEngine
+import torch
 
 D = "/opt/oss/wujiedub/video_translate/20261009/22/3"
 VIDEO = f"{D}/input_videos/e02f89df39.mp4"
@@ -105,19 +107,51 @@ def main():
     _mexp = os.environ.get("MUSETALK_PASTE_MOUTH_EXPAND_RATIO")
     if _mexp is not None:
         cfg.latentsync_paste_mouth_expand_ratio = float(_mexp)
+    # Model-version toggle (offline experiment only; production stays 1.6).
+    # 1.5 = 256-trained UNet (stage2.yaml) -> faster + lower VRAM, lower detail.
+    # Only the unet config + ckpt + whisper paths change; architecture is
+    # identical (cross_attention_dim=384, num_frames=16, in_channels=13).
+    _ver = os.environ.get("MUSETALK_LATENTSYNC_VERSION", "").strip()
+    if _ver == "1.5":
+        cfg.latentsync_unet_config = "./third_party/LatentSync/configs/unet/stage2.yaml"
+        cfg.latentsync_ckpt = "./models/latentsync15/latentsync_unet.pt"
+        cfg.latentsync_whisper = "./models/latentsync15/whisper/tiny.pt"
+    elif _ver == "1.6":
+        cfg.latentsync_unet_config = "./third_party/LatentSync/configs/unet/stage2_512.yaml"
+        cfg.latentsync_ckpt = "./models/latentsync16/latentsync_unet.pt"
+        cfg.latentsync_whisper = "./models/latentsync16/whisper/tiny.pt"
     print(
-        f"[cfg] bbox_detect_stride={cfg.bbox_detect_stride} "
+        f"[cfg] ver={_ver or 'default(1.6)'} "
+        f"unet={os.path.basename(cfg.latentsync_ckpt)} "
+        f"unet_cfg={os.path.basename(cfg.latentsync_unet_config)} "
+        f"bbox_detect_stride={cfg.bbox_detect_stride} "
         f"feather={cfg.latentsync_paste_feather_ratio} "
         f"expand={cfg.latentsync_paste_expand_ratio} "
         f"mouth_only={cfg.latentsync_paste_mouth_only} "
         f"mouth_expand={cfg.latentsync_paste_mouth_expand_ratio} "
         f"steps={cfg.latentsync_inference_steps} -> {OUTPUT}"
     )
+    _t0 = time.time()
     engine = MuseTalkEngine(cfg)
+    _t_load = time.time()
+    print(f"[timing] engine/model load: {_t_load - _t0:.1f}s")
+    if torch.cuda.is_available():
+        torch.cuda.reset_peak_memory_stats()
     result = engine.run_lipsync(vpath, apath, OUTPUT, vad_segments=vad)
+    _t_end = time.time()
     print("RESULT:", json.dumps({k: result[k] for k in
           ("output_path", "frame_count", "speaking_frames", "lipsync_frames")
           if k in result}, ensure_ascii=False))
+    if torch.cuda.is_available():
+        gb = 1024 ** 3
+        print(
+            f"[vram] ver={_ver or '1.6'} peak_allocated={torch.cuda.max_memory_allocated()/gb:.2f}GB "
+            f"peak_reserved={torch.cuda.max_memory_reserved()/gb:.2f}GB"
+        )
+    print(
+        f"[timing] ver={_ver or '1.6'} load={_t_load - _t0:.1f}s "
+        f"run={_t_end - _t_load:.1f}s total={_t_end - _t0:.1f}s"
+    )
 
 
 if __name__ == "__main__":

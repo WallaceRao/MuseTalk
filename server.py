@@ -25,14 +25,31 @@ def _load_service_config() -> ServiceConfig:
     if lipsync_backend:
         config.lipsync_backend = lipsync_backend.strip().lower()
 
+    # LatentSync model-version selector, evaluated at service startup: choose
+    # the 1.6 (512, default) or the 1.5 (256, ~2.7x faster) UNet. Switching the
+    # version swaps the unet config + checkpoint + whisper paths together; the
+    # generation resolution is read from the config's data.resolution, so no
+    # gen-resolution edit is needed. Set MUSETALK_LATENTSYNC_VERSION=1.5|1.6.
+    ls_version = os.environ.get("MUSETALK_LATENTSYNC_VERSION", "").strip()
+    if ls_version == "1.5":
+        config.latentsync_unet_config = "./third_party/LatentSync/configs/unet/stage2.yaml"
+        config.latentsync_ckpt = "./models/latentsync15/latentsync_unet.pt"
+        config.latentsync_whisper = "./models/latentsync15/whisper/tiny.pt"
+    elif ls_version == "1.6":
+        config.latentsync_unet_config = "./third_party/LatentSync/configs/unet/stage2_512.yaml"
+        config.latentsync_ckpt = "./models/latentsync16/latentsync_unet.pt"
+        config.latentsync_whisper = "./models/latentsync16/whisper/tiny.pt"
+
+    # Optional explicit ckpt override (e.g. a custom .pt), applied after version.
     ls_ckpt = os.environ.get("MUSETALK_LATENTSYNC_CKPT")
     if ls_ckpt:
         config.latentsync_ckpt = ls_ckpt
 
-    ls_steps = os.environ.get("MUSETALK_LATENTSYNC_STEPS")
-    if ls_steps is not None:
-        config.latentsync_inference_steps = max(1, int(ls_steps))
+    # Inference steps are LOCKED to 15: validated visually lossless vs 20/30 at
+    # guidance 1.2/1.5. Intentionally NOT env-overridable per production policy.
+    config.latentsync_inference_steps = 15
 
+    # Guidance default is 1.2 online (see ServiceConfig); still env-overridable.
     ls_guidance = os.environ.get("MUSETALK_LATENTSYNC_GUIDANCE")
     if ls_guidance is not None:
         config.latentsync_guidance_scale = float(ls_guidance)

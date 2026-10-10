@@ -224,13 +224,14 @@ class ServiceConfig:
     latentsync_ckpt: str = "./models/latentsync16/latentsync_unet.pt"
     latentsync_whisper: str = "./models/latentsync16/whisper/tiny.pt"
     latentsync_vae: str = "./models/sd-vae"
-    # Inference-acceleration knobs (LatentSync 1.6 baseline was steps=30/guidance=1.5).
-    # steps 30->20 is LatentSync's own default (~1.5x). guidance_scale<=1.0 disables
-    # classifier-free guidance (batch=1/step, ~2x faster) but on real dubbing content
-    # the mouth is audio-constrained so CFG buys little visually (measured: 1.0->1.5 is
-    # +21% wall, PSNR~51 vs 1.0). Kept at 1.5 to match LatentSync's intended CFG.
-    latentsync_inference_steps: int = 20
-    latentsync_guidance_scale: float = 1.5
+    # Production inference knobs. Steps are locked to 15 (server.py forces it too)
+    # -- measured visually lossless vs 20/30 while ~1.5x faster. Guidance lowered
+    # to 1.2 for online: the mouth is audio-constrained so a weaker CFG still
+    # tracks well and avoids the slightly over-crisp look of 1.5. guidance<=1.0
+    # would disable classifier-free guidance (~2x faster) but drops mouth sync
+    # quality on real dubbing, so we keep CFG on at 1.2.
+    latentsync_inference_steps: int = 15
+    latentsync_guidance_scale: float = 1.2
     # Enable TF32 + cuDNN autotuner for the (mostly fixed) 16-frame chunk shapes.
     latentsync_fastpath: bool = True
     # torch.compile the UNet. Disabled by default: with the variable last-chunk

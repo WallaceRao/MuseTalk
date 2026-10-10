@@ -173,6 +173,14 @@ class LatentSyncBackend:
         # pipeline round-trips. These files are discarded, so use the fastest
         # preset; crf is kept low so face quality fed into the UNet is preserved.
         self.clip_preset = str(clip_preset)
+        # Sliding-window stride for the pipeline (frames between window starts).
+        # None/>=num_frames = original non-overlapping 16-frame blocks (each
+        # frame denoised once). A smaller stride overlaps consecutive windows
+        # and averages the overlap, bridging the block-boundary seams that make
+        # the mouth jump during fast motion. Cost grows ~num_frames/stride.
+        # Kill-switch env: MUSETALK_LATENTSYNC_STRIDE (empty/0 keeps default).
+        _stride_env = os.environ.get("MUSETALK_LATENTSYNC_STRIDE", "").strip()
+        self.window_stride = int(_stride_env) if _stride_env and int(_stride_env) > 0 else None
 
         repo_root = os.path.abspath(repo_root)
         if not os.path.isdir(repo_root):
@@ -704,6 +712,7 @@ class LatentSyncBackend:
                 audio_path=audio_path,
                 video_out_path=video_out_path,
                 num_frames=self.num_frames,
+                stride=self.window_stride,
                 num_inference_steps=self.inference_steps,
                 guidance_scale=self.guidance_scale,
                 weight_dtype=self.weight_dtype,
@@ -714,10 +723,11 @@ class LatentSyncBackend:
                 video_fps=video_fps,
             )
             logger.info(
-                "[timing] latentsync pipeline (%d frames, res=%d, steps=%d): %.3fs",
+                "[timing] latentsync pipeline (%d frames, res=%d, steps=%d, stride=%s): %.3fs",
                 expect_frames if expect_frames else -1,
                 gen_res,
                 self.inference_steps,
+                self.window_stride if self.window_stride else "block",
                 time.perf_counter() - _t_pipe,
             )
         except Exception:

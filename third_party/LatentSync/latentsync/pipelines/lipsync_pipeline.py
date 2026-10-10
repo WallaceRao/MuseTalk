@@ -355,6 +355,7 @@ class LipsyncPipeline(DiffusionPipeline):
         audio_path: str,
         video_out_path: str,
         num_frames: int = 16,
+        stride: Optional[int] = None,
         video_fps: float = 25,
         audio_sample_rate: int = 16000,
         height: Optional[int] = None,
@@ -421,8 +422,6 @@ class LipsyncPipeline(DiffusionPipeline):
 
         video_frames, faces, boxes, affine_matrices = self.loop_video(whisper_chunks, video_frames)
 
-        synced_video_frames = []
-
         num_channels_latents = self.vae.config.latent_channels
 
         # Prepare latent variables
@@ -436,18 +435,39 @@ class LipsyncPipeline(DiffusionPipeline):
             generator,
         )
 
-        num_inferences = math.ceil(len(whisper_chunks) / num_frames)
-        for i in tqdm.tqdm(range(num_inferences), desc="Doing inference..."):
+        # Sliding-window inference. stride == num_frames reproduces the original
+        # non-overlapping 16-frame blocks exactly (each frame denoised once).
+        # A smaller stride overlaps consecutive windows so the UNet's 3D
+        # temporality bridges the block boundaries that make the mouth "jump"
+        # during fast motion; overlapping frames are averaged with a running
+        # weight (linear cross-fade across the seam).
+        num_chunks = len(whisper_chunks)
+        if stride is None:
+            stride = num_frames
+        stride = max(1, min(int(stride), num_frames))
+
+        window_starts = []
+        ws = 0
+        while ws < num_chunks:
+            window_starts.append(ws)
+            if ws + num_frames >= num_chunks:
+                break
+            ws += stride
+
+        result_buffer = None
+        weight_buffer = None
+        for start in tqdm.tqdm(window_starts, desc="Doing inference (sliding window)..."):
+            end = min(start + num_frames, num_chunks)
             if self.unet.add_audio_layer:
-                audio_embeds = torch.stack(whisper_chunks[i * num_frames : (i + 1) * num_frames])
+                audio_embeds = torch.stack(whisper_chunks[start:end])
                 audio_embeds = audio_embeds.to(device, dtype=weight_dtype)
                 if do_classifier_free_guidance:
                     null_audio_embeds = torch.zeros_like(audio_embeds)
                     audio_embeds = torch.cat([null_audio_embeds, audio_embeds])
             else:
                 audio_embeds = None
-            inference_faces = faces[i * num_frames : (i + 1) * num_frames]
-            latents = all_latents[:, :, i * num_frames : (i + 1) * num_frames]
+            inference_faces = faces[start:end]
+            latents = all_latents[:, :, start:end]
             ref_pixel_values, masked_pixel_values, masks = self.image_processor.prepare_masks_and_masked_images(
                 inference_faces, affine_transform=False
             )
@@ -507,9 +527,20 @@ class LipsyncPipeline(DiffusionPipeline):
             decoded_latents = self.paste_surrounding_pixels_back(
                 decoded_latents, ref_pixel_values, 1 - masks, device, weight_dtype
             )
-            synced_video_frames.append(decoded_latents)
 
-        synced_video_frames = self.restore_video(torch.cat(synced_video_frames), video_frames, boxes, affine_matrices)
+            n_win = decoded_latents.shape[0]
+            assert n_win == (end - start), f"window decode rows {n_win} != span {end - start}"
+            if result_buffer is None:
+                tail = decoded_latents.shape[1:]
+                result_buffer = torch.zeros(
+                    (num_chunks, *tail), device=device, dtype=decoded_latents.dtype
+                )
+                weight_buffer = torch.zeros((num_chunks, 1, 1, 1), device=device, dtype=decoded_latents.dtype)
+            result_buffer[start:end] += decoded_latents.to(result_buffer.dtype)
+            weight_buffer[start:end] += 1.0
+
+        synced_crop = result_buffer / weight_buffer.clamp(min=1.0)
+        synced_video_frames = self.restore_video(synced_crop, video_frames, boxes, affine_matrices)
 
         audio_samples_remain_length = int(synced_video_frames.shape[0] / video_fps * audio_sample_rate)
         audio_samples = audio_samples[:audio_samples_remain_length].cpu().numpy()

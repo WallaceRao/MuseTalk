@@ -4,6 +4,7 @@ Dumps the final per-frame speaking mask for analysis."""
 import os
 import sys
 import json
+import subprocess
 
 os.environ.setdefault("MUSETALK_LIPSYNC_BACKEND", "latentsync")
 
@@ -21,6 +22,9 @@ OUTPUT = os.path.abspath("verify_210991_fast.mp4")
 _gres = int(os.environ.get("GEN_RES", "0") or 0)
 if _gres:
     OUTPUT = os.path.abspath(f"verify_210991_res{_gres}.mp4")
+_out = os.environ.get("RUN_OUTPUT")
+if _out:
+    OUTPUT = os.path.abspath(_out)
 
 
 def build_vad(path):
@@ -42,6 +46,24 @@ def main():
     setup_logging()
     vad = build_vad(INTER)
     print(f"vad segments: {len(vad)}")
+    vpath, apath = VIDEO, AUDIO
+    _maxsec = float(os.environ.get("MAX_SECONDS", "0") or 0)
+    if _maxsec > 0:
+        os.makedirs("asd_debug", exist_ok=True)
+        vtrim = os.path.abspath(f"asd_debug/in_{int(_maxsec)}s.mp4")
+        atrim = os.path.abspath(f"asd_debug/in_{int(_maxsec)}s.wav")
+        subprocess.run(
+            f'ffmpeg -y -loglevel error -nostdin -i "{VIDEO}" -t {_maxsec} '
+            f'-c:v libx264 -preset ultrafast -crf 16 -pix_fmt yuv420p "{vtrim}"',
+            shell=True,
+        )
+        subprocess.run(
+            f'ffmpeg -y -loglevel error -nostdin -i "{AUDIO}" -t {_maxsec} "{atrim}"',
+            shell=True,
+        )
+        vad = [s for s in vad if s.start < _maxsec]
+        vpath, apath = vtrim, atrim
+        print(f"[trim] first {int(_maxsec)}s -> {len(vad)} vad segs, {vtrim}")
     cfg = ServiceConfig()
     cfg.lipsync_backend = os.environ["MUSETALK_LIPSYNC_BACKEND"]
     _stream = os.environ.get("MUSETALK_STREAM_COMPOSITE")
@@ -63,8 +85,36 @@ def main():
         }
     if _gres:
         cfg.latentsync_gen_resolution = _gres
+    _stride = os.environ.get("MUSETALK_BBOX_DETECT_STRIDE")
+    if _stride is not None:
+        cfg.bbox_detect_stride = max(0, int(_stride))
+    _feather = os.environ.get("MUSETALK_PASTE_FEATHER_RATIO")
+    if _feather is not None:
+        cfg.latentsync_paste_feather_ratio = float(_feather)
+    _expand = os.environ.get("MUSETALK_PASTE_EXPAND_RATIO")
+    if _expand is not None:
+        cfg.latentsync_paste_expand_ratio = float(_expand)
+    _mouth = os.environ.get("MUSETALK_LATENTSYNC_PASTE_MOUTH_ONLY")
+    if _mouth is not None:
+        cfg.latentsync_paste_mouth_only = _mouth.strip().lower() in {
+            "1",
+            "true",
+            "yes",
+            "on",
+        }
+    _mexp = os.environ.get("MUSETALK_PASTE_MOUTH_EXPAND_RATIO")
+    if _mexp is not None:
+        cfg.latentsync_paste_mouth_expand_ratio = float(_mexp)
+    print(
+        f"[cfg] bbox_detect_stride={cfg.bbox_detect_stride} "
+        f"feather={cfg.latentsync_paste_feather_ratio} "
+        f"expand={cfg.latentsync_paste_expand_ratio} "
+        f"mouth_only={cfg.latentsync_paste_mouth_only} "
+        f"mouth_expand={cfg.latentsync_paste_mouth_expand_ratio} "
+        f"steps={cfg.latentsync_inference_steps} -> {OUTPUT}"
+    )
     engine = MuseTalkEngine(cfg)
-    result = engine.run_lipsync(VIDEO, AUDIO, OUTPUT, vad_segments=vad)
+    result = engine.run_lipsync(vpath, apath, OUTPUT, vad_segments=vad)
     print("RESULT:", json.dumps({k: result[k] for k in
           ("output_path", "frame_count", "speaking_frames", "lipsync_frames")
           if k in result}, ensure_ascii=False))

@@ -264,12 +264,62 @@ class ServiceConfig:
     latentsync_paste_primary_only: bool = True
     latentsync_paste_expand_ratio: float = 0.35
     latentsync_paste_feather_ratio: float = 0.2
+    # Mouth-only paste: composite the LatentSync result only around the mouth box
+    # so cheeks/forehead/eyes keep the sharp original plate. LatentSync only
+    # regenerates the mouth, but pasting its whole (512 VAE-decoded, softer)
+    # restored face blurs the entire face on close-ups. Off by default until the
+    # A/B is validated. Falls back to the primary-face paste when no mouth box.
+    latentsync_paste_mouth_only: bool = False
+    latentsync_paste_mouth_expand_ratio: float = 0.30
+    latentsync_paste_mouth_feather_ratio: float = 0.25
     # Overlap the CPU composite+encode with GPU generation: composite each
     # LatentSync run on a background writer thread while the next run is still
     # being generated. Per-run blend alphas are computed on the run's own isolated
     # active block, which is byte-identical to the global ramp (runs are separated
     # by >=1 non-speaking frame). Kill-switch: set False to restore the serial path.
     stream_composite: bool = True
+
+
+def _latentsync_paste_params(
+    cfg: "ServiceConfig",
+    face_bbox,
+    mouth_bbox,
+    coord_placeholder,
+    height: int,
+) -> "Optional[tuple[list, float, float]]":
+    """Decide the LatentSync paste region + feather for one frame.
+
+    Returns ``(paste_bbox, expand_ratio, feather_ratio)`` or ``None`` when no
+    geometric paste should happen (caller falls back to a plain alpha blend).
+    Mouth-only mode pastes just an expanded mouth box (keeps cheeks/eyes as the
+    sharp original); otherwise it uses the primary-face box. Missing/invalid
+    mouth box degrades to the face box so we never drop the sync.
+    """
+    def _valid(b) -> bool:
+        return (
+            b is not None
+            and b != coord_placeholder
+            and len(b) >= 4
+            and float(b[2]) > float(b[0])
+            and float(b[3]) > float(b[1])
+        )
+
+    if cfg.latentsync_paste_mouth_only and _valid(mouth_bbox):
+        return (
+            [float(v) for v in mouth_bbox[:4]],
+            cfg.latentsync_paste_mouth_expand_ratio,
+            cfg.latentsync_paste_mouth_feather_ratio,
+        )
+    if cfg.latentsync_paste_primary_only and _valid(face_bbox):
+        paste_bbox = list(face_bbox)
+        if cfg.version == "v15":
+            paste_bbox[3] = min(float(paste_bbox[3]) + cfg.extra_margin, float(height))
+        return (
+            paste_bbox,
+            cfg.latentsync_paste_expand_ratio,
+            cfg.latentsync_paste_feather_ratio,
+        )
+    return None
 
 
 class MuseTalkEngine:
@@ -694,6 +744,7 @@ class MuseTalkEngine:
         coord_list: Sequence,
         coord_placeholder,
         mouth_vis_list: Optional[List[float]],
+        mouth_coord_list: Optional[Sequence] = None,
         audio_path: str,
         infer_indices: List[int],
         fps: float,
@@ -757,23 +808,22 @@ class MuseTalkEngine:
                     combine_frame, (width, height), interpolation=cv2.INTER_LANCZOS4
                 )
             bbox = coord_list[i] if i < len(coord_list) else None
-            if (
-                cfg.latentsync_paste_primary_only
-                and bbox is not None
-                and bbox != coord_placeholder
-            ):
-                paste_bbox = list(bbox)
-                if cfg.version == "v15":
-                    paste_bbox[3] = min(
-                        float(paste_bbox[3]) + cfg.extra_margin,
-                        float(height),
-                    )
+            mouth_bbox = (
+                mouth_coord_list[i]
+                if mouth_coord_list is not None and i < len(mouth_coord_list)
+                else None
+            )
+            paste = _latentsync_paste_params(
+                cfg, bbox, mouth_bbox, coord_placeholder, height
+            )
+            if paste is not None:
+                paste_bbox, expand_ratio, feather_ratio = paste
                 combine_frame = paste_lipsync_in_bbox(
                     ori_frame,
                     combine_frame,
                     paste_bbox,
-                    expand_ratio=cfg.latentsync_paste_expand_ratio,
-                    feather_ratio=cfg.latentsync_paste_feather_ratio,
+                    expand_ratio=expand_ratio,
+                    feather_ratio=feather_ratio,
                     alpha=alpha,
                 )
             elif alpha < 0.999:
@@ -1625,6 +1675,7 @@ class MuseTalkEngine:
                         coord_list=coord_list,
                         coord_placeholder=coord_placeholder,
                         mouth_vis_list=mouth_vis_list,
+                        mouth_coord_list=mouth_coord_list,
                         audio_path=audio_path,
                         infer_indices=infer_indices,
                         fps=float(fps),
@@ -1747,23 +1798,22 @@ class MuseTalkEngine:
                                 combine_frame, (width, height), interpolation=cv2.INTER_LANCZOS4
                             )
                         bbox = coord_list[i] if i < len(coord_list) else None
-                        if (
-                            cfg.latentsync_paste_primary_only
-                            and bbox is not None
-                            and bbox != coord_placeholder
-                        ):
-                            paste_bbox = list(bbox)
-                            if cfg.version == "v15":
-                                paste_bbox[3] = min(
-                                    float(paste_bbox[3]) + cfg.extra_margin,
-                                    float(height),
-                                )
+                        mouth_bbox = (
+                            mouth_coord_list[i]
+                            if mouth_coord_list is not None and i < len(mouth_coord_list)
+                            else None
+                        )
+                        paste = _latentsync_paste_params(
+                            cfg, bbox, mouth_bbox, coord_placeholder, height
+                        )
+                        if paste is not None:
+                            paste_bbox, expand_ratio, feather_ratio = paste
                             combine_frame = paste_lipsync_in_bbox(
                                 ori_frame,
                                 combine_frame,
                                 paste_bbox,
-                                expand_ratio=cfg.latentsync_paste_expand_ratio,
-                                feather_ratio=cfg.latentsync_paste_feather_ratio,
+                                expand_ratio=expand_ratio,
+                                feather_ratio=feather_ratio,
                                 alpha=alpha,
                             )
                         elif alpha < 0.999:

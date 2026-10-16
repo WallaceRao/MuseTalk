@@ -15,6 +15,7 @@ Pipeline
 from __future__ import annotations
 
 import logging
+from collections import defaultdict
 from dataclasses import dataclass
 from typing import Dict, List, Optional, Sequence, Tuple
 
@@ -673,6 +674,135 @@ def assigned_segments_to_mask(
     return mask
 
 
+def compute_voice_reassign_intervals(
+    vad_segments: Sequence,
+    voice_cos: "np.ndarray",
+    frame_tracks: Sequence[Dict[int, BBox]],
+    open_probs: Dict[int, List[float]],
+    coord_list: Sequence[BBox],
+    shot_ids: Sequence[int],
+    *,
+    fps: float,
+    same_speaker_thr: float = 0.40,
+    presence_floor: float = 0.50,
+    piece_min_sec: float = 0.50,
+    talk_open_thr: float = 0.5,
+) -> dict:
+    """Greedy re-assignment for the ONLY case we touch: a face fed >=2 sentences.
+
+    Ported from the offline probe (validated on task 215838): split each VAD
+    segment into shot-local pieces, own each piece by the dominant on-screen
+    face, and when one face is claimed by >=2 different sentences re-decide them
+    by (a) that track's anchor identity = the sentence with the most exclusive
+    talking-time on it, and (b) voice cosine to that anchor. A piece whose voice
+    does not match its shot face is dropped (off-screen / wrong face).
+
+    Returns {"off": [(i0,i1)], "on": [(i0,i1)], "diag": [...]} as FRAME index
+    ranges (i0 inclusive, i1 exclusive). Empty when nothing conflicts, so the
+    caller can no-op. Non-conflict pieces are never emitted -> zero blast radius.
+    """
+    from musetalk.utils.vad_client import vad_span
+
+    n = len(coord_list)
+    fps = float(fps) if fps and fps > 0 else 25.0
+    nsent = len(vad_segments)
+    if nsent < 2 or n == 0 or voice_cos is None:
+        return {"off": [], "on": [], "diag": []}
+
+    def frames_of(seg):
+        s0, s1 = vad_span(seg)
+        return max(0, int(round(s0 * fps))), min(n, int(round(s1 * fps)))
+
+    def smooth(tid, t, R=2):
+        pr = open_probs.get(tid)
+        if not pr:
+            return 0.0
+        vals = [pr[i] for i in range(max(0, t - R), min(len(pr), t + R + 1))
+                if i < len(pr) and np.isfinite(pr[i])]
+        return (sum(vals) / len(vals)) if vals else 0.0
+
+    # ---- shot-local pieces with presence ownership ----
+    pieces = []
+    for si, seg in enumerate(vad_segments):
+        f0, f1 = frames_of(seg)
+        bounds = [f0] + [i for i in range(f0 + 1, f1)
+                         if i < n and int(shot_ids[i]) != int(shot_ids[i - 1])] + [f1]
+        for a, b in zip(bounds, bounds[1:]):
+            if (b - a) < piece_min_sec * fps:
+                continue
+            d = defaultdict(float)
+            for i in range(a, b):
+                for tid in frame_tracks[i] if i < len(frame_tracks) else ():
+                    d[int(tid)] += 1.0
+            d = {tid: c / (b - a) for tid, c in d.items()}
+            best = max(d, key=d.get) if d else None
+            pieces.append({
+                "si": si, "a": a, "b": b, "p": d,
+                "face": best if best is not None and d[best] >= presence_floor else None,
+            })
+
+    # ---- conflict = a face fed pieces from >=2 different sentences ----
+    face_sents = defaultdict(set)
+    for pc in pieces:
+        if pc["face"] is not None:
+            face_sents[pc["face"]].add(pc["si"])
+    conflict_faces = {f for f, ss in face_sents.items() if len(ss) >= 2}
+    if not conflict_faces:
+        return {"off": [], "on": [], "diag": []}
+    conflict_sents = {si for f in conflict_faces for si in face_sents[f]}
+    P = [pi for pi, pc in enumerate(pieces)
+         if pc["face"] in conflict_faces or pc["si"] in conflict_sents]
+
+    # ---- anchor identity per face = max exclusive talking-time sentence ----
+    face_sent_secs = defaultdict(lambda: defaultdict(float))
+    for pc in pieces:
+        if pc["face"] is None:
+            continue
+        f, si = pc["face"], pc["si"]
+        wsum = 0.0
+        for i in range(pc["a"], pc["b"]):
+            if smooth(f, i) >= talk_open_thr:
+                wsum += 1.0 / fps
+        face_sent_secs[f][si] += max(wsum, 1e-3)
+    face_identity = {f: max(ss, key=ss.get) for f, ss in face_sent_secs.items()}
+
+    # ---- greedy by descending presence, anchor-identity + voice gated ----
+    cands = []
+    for pi in P:
+        for face, pv in pieces[pi]["p"].items():
+            if pv >= presence_floor:
+                cands.append((pv, pi, face))
+    cands.sort(key=lambda x: -x[0])
+    bound = {}
+    for pi, pc in enumerate(pieces):
+        if pi not in P:
+            bound[pi] = pc["face"]
+        elif pc["face"] is not None and face_identity.get(pc["face"]) == pc["si"]:
+            bound[pi] = pc["face"]  # own-track anchor -> locked, never stolen
+    for pv, pi, face in cands:
+        if pi in bound:
+            continue
+        si = pieces[pi]["si"]
+        idt = face_identity.get(face)
+        if idt is None or si == idt or float(voice_cos[si, idt]) >= same_speaker_thr:
+            bound[pi] = face
+
+    # ---- translate conflict-piece verdicts into explicit mask overrides ----
+    off, on, diag = [], [], []
+    for pi in P:
+        pc = pieces[pi]
+        f = bound.get(pi)
+        a, b = pc["a"], pc["b"]
+        if f is None:
+            off.append((a, b))  # voice is NOT this shot's face -> stop driving it
+            diag.append(("seg%d" % pc["si"], "%.2f-%.2f" % (a / fps, b / fps), "SKIP"))
+        else:
+            on.append((a, b))   # drive the (already correct per-shot) coord face
+            diag.append(("seg%d" % pc["si"], "%.2f-%.2f" % (a / fps, b / fps),
+                         "t%d" % f))
+    return {"off": off, "on": on, "diag": diag, "conflict_faces": sorted(conflict_faces)}
+
+
 def build_fused_speaking_mask(
     vsdlm_detector,
     frame_list: Sequence[np.ndarray],
@@ -928,6 +1058,9 @@ def build_fused_speaking_mask(
             if int(active_speaker[i]) != int(fallback_primary):
                 switched += 1
 
+    # Multi-speaker face re-assignment is applied by the CALLER after all shot-fill
+    # / expand stages (it needs per-SENTENCE spans, not this function's merged VAD).
+    # We only expose the raw per-frame signals it consumes.
     meta = {
         "n_face_tracks": n_tracks,
         "n_visual_intervals": len(visual_intervals),
@@ -950,6 +1083,8 @@ def build_fused_speaking_mask(
         "raw_speaking_frames": sum(mask),
         "n_shots": n_shots,
         "shot_ids": list(shot_ids) if shot_ids is not None else None,
+        "frame_tracks": frame_tracks,
+        "open_probs": open_probs,
         "detect_stride": int(detect_stride),
         "vsdlm_providers": list(getattr(vsdlm_detector, "providers", [])),
         "speaker_select": "primary",

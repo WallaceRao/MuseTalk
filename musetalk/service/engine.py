@@ -39,6 +39,7 @@ from musetalk.utils.active_speaker import (
     prune_short_speaking_runs,
 )
 from musetalk.utils.vad_vsdlm_fusion import build_fused_speaking_mask
+from musetalk.utils import voiceprint as _voiceprint
 from musetalk.utils.yaw_gate import apply_yaw_hysteresis_gate
 from musetalk.utils.audio_processor import AudioProcessor
 from musetalk.utils.blending import (
@@ -127,6 +128,14 @@ class ServiceConfig:
     vsdlm_shot_fill_ratio: float = 0.35
     # Max time gap when assigning a VAD segment to a non-overlapping visual speaker.
     vad_assign_max_gap_sec: float = 0.5
+    # Multi-speaker face re-assignment: when one face would be driven by >=2
+    # different sentences, re-decide them by shot-local ownership + ORIGINAL-audio
+    # voiceprint. Only fires when the task dir exposes origin per-sentence clips;
+    # otherwise build_voice_cos returns None and this is a strict no-op.
+    lipsync_voice_reassign: bool = True
+    voice_same_speaker_thr: float = 0.40
+    voice_presence_floor: float = 0.50
+    voice_piece_min_sec: float = 0.50
     # SCRFD multi-face detect every N frames inside VAD×VSDLM fusion.
     asd_face_detect_stride: int = 3
     # Legacy AV-sync ASD (optional fallback when use_vsdlm=False).
@@ -1500,6 +1509,59 @@ class MuseTalkEngine:
                     video_num,
                     ", ".join(shot_spans),
                 )
+
+            # Apply multi-speaker face re-assignment LAST so no shot-fill / expand
+            # stage can re-merge the corrected boundaries. Re-segments on the task's
+            # ORIGINAL per-sentence spans (the pipeline VAD merges contiguous dub
+            # lines, so it cannot separate two speakers inside one block). Off = stop
+            # driving a face a different speaker's voice was attached to; On = wake
+            # the (already per-shot-correct) coord face the base gate left silent.
+            if (
+                cfg.lipsync_voice_reassign
+                and fusion_meta is not None
+                and speaking_mask is not None
+                and fusion_meta.get("frame_tracks") is not None
+            ):
+                vr = _voiceprint.plan_voice_reassign(
+                    audio_path,
+                    fusion_meta["frame_tracks"],
+                    fusion_meta.get("open_probs") or {},
+                    coord_list,
+                    list(fusion_meta["shot_ids"])[:video_num],
+                    fps=fps,
+                    same_speaker_thr=cfg.voice_same_speaker_thr,
+                    presence_floor=cfg.voice_presence_floor,
+                    piece_min_sec=cfg.voice_piece_min_sec,
+                )
+                off_iv = vr.get("off") or []
+                on_iv = vr.get("on") or []
+                if vr.get("diag"):
+                    logger.info(
+                        "Voice re-assign: conflict_faces=%s verdicts=%s",
+                        ["t%d" % f for f in vr.get("conflict_faces", [])],
+                        vr["diag"],
+                    )
+                if off_iv or on_iv:
+                    _m_len = len(speaking_mask)
+                    _valid_face = [
+                        b != coord_placeholder for b in coord_list[:_m_len]
+                    ]
+                    turned_off = turned_on = 0
+                    for i0, i1 in off_iv:
+                        for k in range(max(0, int(i0)), min(_m_len, int(i1))):
+                            if speaking_mask[k]:
+                                speaking_mask[k] = False
+                                turned_off += 1
+                    for i0, i1 in on_iv:
+                        for k in range(max(0, int(i0)), min(_m_len, int(i1))):
+                            if _valid_face[k] and not speaking_mask[k]:
+                                speaking_mask[k] = True
+                                turned_on += 1
+                    speaking_frames = sum(speaking_mask)
+                    logger.info(
+                        "Voice re-assign applied: -%d +%d frames -> %d/%d speaking",
+                        turned_off, turned_on, speaking_frames, _m_len,
+                    )
 
             infer_indices = []
             frame_h0, frame_w0 = frame_list[0].shape[:2]

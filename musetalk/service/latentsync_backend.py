@@ -97,19 +97,26 @@ def cleanup_runs(
         return list(runs)
 
     def _same_face(prev_end: int, next_start: int) -> bool:
-        # Primary gate: both boundary frames must be in the same shot. Unknown
-        # shot id (out of range) -> treat as different to stay safe.
+        # Merge two adjacent runs ONLY when the boundary frames are BOTH the same
+        # camera shot AND the same face. shot_ids (HSV/MAE cut detector) is the
+        # authoritative shot gate; the coord_list bbox-IoU adds a per-face check
+        # so two DIFFERENT people inside one static two-shot are never stitched
+        # into a single clip (that would drive the wrong mouth). A signal that is
+        # unavailable (None / out of range) simply cannot veto; if we have neither
+        # signal we fall back to the old temporal-only merge.
+        have = False
+        ok = True
         if shot_ids is not None:
             a = shot_ids[prev_end] if 0 <= prev_end < len(shot_ids) else None
             b = shot_ids[next_start] if 0 <= next_start < len(shot_ids) else None
-            return a is not None and a == b
-        # Fallback (no shot info): keep the old (unguarded) temporal-only merge
-        # when there is no face data or a non-positive threshold.
-        if coord_list is None or merge_iou_min <= 0:
-            return True
-        a = coord_list[prev_end] if 0 <= prev_end < len(coord_list) else None
-        b = coord_list[next_start] if 0 <= next_start < len(coord_list) else None
-        return _bbox_iou(a, b) >= merge_iou_min
+            ok = ok and (a is not None and a == b)
+            have = True
+        if coord_list is not None and merge_iou_min > 0:
+            ca = coord_list[prev_end] if 0 <= prev_end < len(coord_list) else None
+            cb = coord_list[next_start] if 0 <= next_start < len(coord_list) else None
+            ok = ok and (_bbox_iou(ca, cb) >= merge_iou_min)
+            have = True
+        return ok if have else True
 
     merged: List[List[int]] = [[int(runs[0][0]), int(runs[0][1])]]
     for s, e in runs[1:]:
@@ -581,7 +588,8 @@ class LatentSyncBackend:
                 _kept_frames,
                 _min_run,
                 _merge_gap,
-                ("shot" if shot_ids is not None else f"iou{_merge_iou:.2f}"),
+                ("shot+iou" if shot_ids is not None and _merge_iou > 0
+                 else ("shot" if shot_ids is not None else f"iou{_merge_iou:.2f}")),
             )
         if not runs:
             if infer_indices:

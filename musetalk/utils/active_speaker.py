@@ -727,6 +727,71 @@ class VSDLMDetector:
         min_frames = max(1, int(round(duration * fps))) if duration > 0 else 1
         return self._keep_runs_at_least(motion, min_frames, shot_ids=shot_ids)
 
+    def lip_motion_mask(
+        self,
+        open_probs: Sequence[float],
+        coord_list: Sequence[Tuple[float, float, float, float]],
+        mouth_mar_list: Sequence[Optional[float]] | None,
+        *,
+        window: int = 4,
+        op_motion_min: float = 0.02,
+        mar_motion_min: float = 0.015,
+        identity_min_iou: float = 0.5,
+        shot_ids: Sequence[int] | None = None,
+    ) -> List[bool]:
+        """Per-frame lip-motion gate (complements the op+mar state gate).
+
+        A frame counts as "moving" when the rolling std of the VSDLM open-prob
+        (primary signal) **or** the landmark MAR within a same-shot / same-
+        identity window clears a *loose* bar. This suppresses a mouth that is
+        open but **frozen** (e.g. a surprised gasp held open: op pinned ~1.0 so
+        std~0, mar steady) which the state gate (``op>=thr AND mar>=thr``)
+        cannot distinguish from real talking. Real speech oscillates open/closed
+        per phoneme, so its op-std stays well above a loose bar (measured
+        ~0.07-0.42 vs ~0.00 for a static gasp); we therefore keep the threshold
+        low so sustained-open talkers are not re-suppressed (the old std-gate
+        pitfall). Both bars <= 0 disables the gate (returns all-True).
+        """
+        from musetalk.utils.preprocessing import _bbox_iou
+
+        n = len(coord_list)
+        op_min = max(0.0, float(op_motion_min))
+        mar_min = max(0.0, float(mar_motion_min))
+        if op_min <= 0 and mar_min <= 0:
+            return [True] * n
+        win = max(1, int(window))
+        out: List[bool] = []
+        for i in range(n):
+            if (
+                coord_list[i] == coord_placeholder
+                or i >= len(open_probs)
+                or not np.isfinite(open_probs[i])
+            ):
+                out.append(False)
+                continue
+            cur = coord_list[i]
+            cur_shot = int(shot_ids[i]) if shot_ids is not None else None
+            ops: List[float] = []
+            mars: List[float] = []
+            for j in range(max(0, i - win), min(n, i + win + 1)):
+                if shot_ids is not None and int(shot_ids[j]) != cur_shot:
+                    continue
+                if coord_list[j] == coord_placeholder:
+                    continue
+                if j != i and _bbox_iou(cur, coord_list[j]) < identity_min_iou:
+                    continue
+                if j < len(open_probs) and np.isfinite(open_probs[j]):
+                    ops.append(float(open_probs[j]))
+                if mouth_mar_list is not None and j < len(mouth_mar_list):
+                    mj = mouth_mar_list[j]
+                    if mj is not None and np.isfinite(mj):
+                        mars.append(float(mj))
+            opstd = float(np.std(ops)) if len(ops) >= 3 else 0.0
+            marstd = float(np.std(mars)) if len(mars) >= 3 else 0.0
+            ok = (op_min > 0 and opstd >= op_min) or (mar_min > 0 and marstd >= mar_min)
+            out.append(bool(ok))
+        return out
+
     def speaking_mask_from_open_probs(
         self,
         open_probs: Sequence[float],

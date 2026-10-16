@@ -695,6 +695,8 @@ def build_fused_speaking_mask(
     speak_mar_threshold: float = 0.12,
     shot_fill_ratio: float = 0.35,
     enable_shot_fill: bool = True,
+    motion_op_std: float = 0.0,
+    motion_mar_std: float = 0.0,
 ) -> Tuple[List[bool], dict]:
     """VAD ∩ lip-motion on the MuseTalk primary face.
 
@@ -820,6 +822,33 @@ def build_fused_speaking_mask(
             shot_ids=shot_ids,
         )
         primary_visual = list(primary_visual[:n])
+
+        # Loose lip-motion gate: AND an "is the mouth actually moving" check on
+        # top of the op+mar state gate so a frozen-open mouth (surprised gasp,
+        # op pinned ~1.0 / std~0) does not drive lipsync, while real talking
+        # (op/mar oscillate per phoneme) survives. Disabled when both bars<=0.
+        if motion_op_std > 0 or motion_mar_std > 0:
+            motion = vsdlm_detector.lip_motion_mask(
+                p_probs,
+                p_coords,
+                mouth_mar_list,
+                window=vsdlm_detector.activity_window,
+                op_motion_min=motion_op_std,
+                mar_motion_min=motion_mar_std,
+                shot_ids=shot_ids,
+            )
+            before_motion = sum(primary_visual)
+            primary_visual = [
+                bool(a) and bool(b) for a, b in zip(primary_visual, motion)
+            ]
+            logger.info(
+                "Lip-motion gate (op_std>=%.3f or mar_std>=%.3f): primary %d -> %d/%d",
+                motion_op_std,
+                motion_mar_std,
+                before_motion,
+                sum(primary_visual),
+                n,
+            )
 
     vad_segments = detect_voice_segments(
         audio_path,

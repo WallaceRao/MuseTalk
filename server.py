@@ -128,6 +128,38 @@ def _load_service_config() -> ServiceConfig:
     if soft_closed is not None:
         config.vsdlm_soft_closed_mar = max(0.0, float(soft_closed))
 
+    # Hard MAR gate for the dubbing mouth-open speaking decision
+    # (speaking_mask_op_mar: op>=speak_open_threshold AND mar>=speak_mar_threshold).
+    # Lower it (together with MUSETALK_VSDLM_SOFT_CLOSED_MAR) to recover soft /
+    # crying / side-face speech whose landmark MAR dips below the 0.12 default.
+    speak_mar = os.environ.get("MUSETALK_VSDLM_SPEAK_MAR_THRESHOLD")
+    if speak_mar is not None:
+        config.vsdlm_speak_mar_threshold = max(0.0, float(speak_mar))
+
+    speak_open = os.environ.get("MUSETALK_VSDLM_SPEAK_OPEN_THRESHOLD")
+    if speak_open is not None:
+        config.vsdlm_speak_open_threshold = max(0.0, float(speak_open))
+
+    # Loose lip-motion gate (AND on top of op+mar state gate): rolling std of
+    # VSDLM open-prob >= OP_STD OR landmark MAR std >= MAR_STD within the
+    # activity window. Suppresses frozen-open mouths (surprised gasp) that pass
+    # the state gate but never move. 0/absent = disabled.
+    motion_op = os.environ.get("MUSETALK_VSDLM_MOTION_OP_STD")
+    if motion_op is not None:
+        config.vsdlm_motion_op_std = max(0.0, float(motion_op))
+
+    motion_mar = os.environ.get("MUSETALK_VSDLM_MOTION_MAR_STD")
+    if motion_mar is not None:
+        config.vsdlm_motion_mar_std = max(0.0, float(motion_mar))
+
+    # Utterance-level fill: drive a whole (VAD∩shot) region when the primary
+    # face is gated speaking for >= this fraction of its face-present frames.
+    # Lower it to keep filling a shot whose motion-gated speaking ratio dropped
+    # (e.g. soft/crying speech) so short holes like ~33s stay covered.
+    shot_fill = os.environ.get("MUSETALK_VSDLM_SHOT_FILL_RATIO")
+    if shot_fill is not None:
+        config.vsdlm_shot_fill_ratio = max(0.0, min(1.0, float(shot_fill)))
+
     use_vad_fusion = os.environ.get("MUSETALK_USE_VAD_FUSION")
     if use_vad_fusion is not None:
         config.use_vad_fusion = use_vad_fusion.strip().lower() in {

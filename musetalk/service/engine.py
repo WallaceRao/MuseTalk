@@ -115,6 +115,13 @@ class ServiceConfig:
     # on closed-but-smiling listeners; mar alone is noisy under hands/hair.
     vsdlm_speak_open_threshold: float = 0.5
     vsdlm_speak_mar_threshold: float = 0.12
+    # Loose lip-motion gate (AND-ed on top of the op+mar state gate): a frame is
+    # only "speaking" if the rolling std of VSDLM open-prob >= op_std OR landmark
+    # MAR std >= mar_std within the activity window. Kills frozen-open mouths
+    # (surprised gasp: op~1.0, std~0) while real talking (op/mar oscillate)
+    # passes. 0 = disabled (preserves prior behavior). Tune via env.
+    vsdlm_motion_op_std: float = 0.0
+    vsdlm_motion_mar_std: float = 0.0
     # Utterance-level fill: drive a whole (VAD∩shot) region when the primary
     # face is gated speaking for >= this fraction of its face-present frames.
     vsdlm_shot_fill_ratio: float = 0.35
@@ -1048,6 +1055,8 @@ class MuseTalkEngine:
                         speak_open_threshold=cfg.vsdlm_speak_open_threshold,
                         speak_mar_threshold=cfg.vsdlm_speak_mar_threshold,
                         shot_fill_ratio=cfg.vsdlm_shot_fill_ratio,
+                        motion_op_std=cfg.vsdlm_motion_op_std,
+                        motion_mar_std=cfg.vsdlm_motion_mar_std,
                     )
                     speaking_mask = speaking_mask[:video_num]
                     logger.info(

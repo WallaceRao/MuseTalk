@@ -49,7 +49,7 @@ def _load_service_config() -> ServiceConfig:
     # guidance 1.2/1.5. Intentionally NOT env-overridable per production policy.
     config.latentsync_inference_steps = 15
 
-    # Guidance default is 1.2 online (see ServiceConfig); still env-overridable.
+    # Guidance default is 1.5 online (see ServiceConfig); still env-overridable.
     ls_guidance = os.environ.get("MUSETALK_LATENTSYNC_GUIDANCE")
     if ls_guidance is not None:
         config.latentsync_guidance_scale = float(ls_guidance)

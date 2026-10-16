@@ -136,25 +136,78 @@ def clip_vad_segments_to_window(
     return out
 
 
+def _resolve_vad_pad_sec(pad_sec: Optional[float]) -> float:
+    """Pad seconds to grow each VAD segment: explicit arg > env > default 0.1."""
+    if pad_sec is None:
+        pad_sec = os.environ.get("MUSETALK_VAD_PAD_SEC", "0.1")
+    try:
+        return max(0.0, float(pad_sec))
+    except (TypeError, ValueError):
+        return 0.1
+
+
+def pad_vad_segments(
+    segments: Sequence[VadSegment], pad_sec: float
+) -> List[VadSegment]:
+    """Grow every segment's start and end by ``pad_sec`` and merge overlaps.
+
+    A small onset/offset safety margin so a speaker who has already started
+    (or is just finishing) a word is not left unsynced because TenVAD trimmed
+    the boundary a touch early. Start is clamped to >=0; segments that touch or
+    overlap after padding are joined (first segment's gender wins).
+    """
+    pad = max(0.0, float(pad_sec))
+    if pad <= 0 or not segments:
+        return list(segments)
+    padded: List[VadSegment] = []
+    for seg in segments:
+        start, end = vad_span(seg)
+        padded.append(
+            VadSegment(max(0.0, start - pad), end + pad, vad_gender(seg))
+        )
+    padded.sort(key=lambda s: s.start)
+    merged: List[VadSegment] = [padded[0]]
+    for seg in padded[1:]:
+        prev = merged[-1]
+        if seg.start <= prev.end:  # overlap after padding -> join
+            merged[-1] = VadSegment(
+                prev.start, max(prev.end, seg.end), prev.gender or vad_gender(seg)
+            )
+        else:
+            merged.append(seg)
+    return merged
+
+
 def detect_voice_segments(
     audio_path: str,
     *,
     vad_url: str | None = None,
     timeout_sec: float = 120.0,
     vad_segments: Sequence[VadSegment] | None = None,
+    pad_sec: Optional[float] = None,
 ) -> List[VadSegment]:
     """Return voice segments, optionally using client-provided ``vad_segments``.
 
     When ``vad_segments`` is not ``None``, remote TenVAD is skipped and the
     provided list is normalized/returned as-is.
+
+    Every returned segment is grown by ``pad_sec`` at both ends (env
+    ``MUSETALK_VAD_PAD_SEC``, default 0.1s) so speech onset/offset is not
+    trimmed short, leaving the speaker already talking before sync kicks in.
     """
+    pad = _resolve_vad_pad_sec(pad_sec)
     if vad_segments is not None:
         out = normalize_vad_segments(list(vad_segments), strict=True)
+        n_raw = len(out)
+        out = pad_vad_segments(out, pad)
         n_gender = sum(1 for s in out if s.gender is not None)
         logger.info(
-            "VAD (client-provided): %d voice segments (%d with gender, skip remote detect)",
+            "VAD (client-provided): %d voice segments (%d with gender, skip remote detect)"
+            " [pad=%.2fs -> %d seg]",
             len(out),
             n_gender,
+            pad,
+            n_raw,
         )
         return out
 
@@ -172,13 +225,18 @@ def detect_voice_segments(
     payload = response.json()
     segments = payload.get("voice_segments") or []
     out = normalize_vad_segments(segments, strict=False)
+    n_raw = len(out)
+    out = pad_vad_segments(out, pad)
     n_gender = sum(1 for s in out if s.gender is not None)
     logger.info(
-        "VAD (%s): %d voice segments (%d with gender) from %s",
+        "VAD (%s): %d voice segments (%d with gender) from %s"
+        " [pad=%.2fs -> %d seg]",
         url,
         len(out),
         n_gender,
         audio_path,
+        pad,
+        n_raw,
     )
     return out
 

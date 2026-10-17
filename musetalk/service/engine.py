@@ -132,8 +132,11 @@ class ServiceConfig:
     # that track's independent VSDLM open-prob motion; veto the run when the
     # track shows no mouth motion (op_std<op_std AND op_mean<op_mean) -- the same
     # calibrated rule as the voice-reassign re-check (absolute op is unreliable).
-    # Runs with no boundable/finite track fall back to trusting primary. Off by default.
-    vsdlm_track_agree_check: bool = False
+    # Runs with no boundable/finite track fall back to trusting primary. Enabled
+    # by default (validated on 215912: vetoes silent-listener mis-syncs such as
+    # the 10-11s primary false positive while keeping every real speaker). Set
+    # env MUSETALK_VSDLM_TRACK_AGREE=0 to roll back.
+    vsdlm_track_agree_check: bool = True
     vsdlm_track_agree_op_std: float = 0.02
     vsdlm_track_agree_op_mean: float = 0.35
     vsdlm_track_agree_min_cov: float = 0.5

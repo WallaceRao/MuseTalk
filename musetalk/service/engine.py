@@ -126,6 +126,18 @@ class ServiceConfig:
     # Utterance-level fill: drive a whole (VAD∩shot) region when the primary
     # face is gated speaking for >= this fraction of its face-present frames.
     vsdlm_shot_fill_ratio: float = 0.35
+    # Track-agreement cross-check (primary false-positive veto): the MuseTalk
+    # primary dual-crop can read a *closed* mouth as open (op>=0.5). For each
+    # gated run, bind the primary box to the best-IoU SCRFD track and measure
+    # that track's independent VSDLM open-prob motion; veto the run when the
+    # track shows no mouth motion (op_std<op_std AND op_mean<op_mean) -- the same
+    # calibrated rule as the voice-reassign re-check (absolute op is unreliable).
+    # Runs with no boundable/finite track fall back to trusting primary. Off by default.
+    vsdlm_track_agree_check: bool = False
+    vsdlm_track_agree_op_std: float = 0.02
+    vsdlm_track_agree_op_mean: float = 0.35
+    vsdlm_track_agree_min_cov: float = 0.5
+    vsdlm_track_agree_min_iou: float = 0.3
     # Max time gap when assigning a VAD segment to a non-overlapping visual speaker.
     vad_assign_max_gap_sec: float = 0.5
     # Multi-speaker face re-assignment: when one face would be driven by >=2
@@ -136,6 +148,15 @@ class ServiceConfig:
     voice_same_speaker_thr: float = 0.40
     voice_presence_floor: float = 0.50
     voice_piece_min_sec: float = 0.50
+    # Visual re-check on re-assign "on": a face claimed by a sentence must show
+    # real mouth motion (open-prob std >= on_min_op_std, mirroring the lip-motion
+    # gate) or be held clearly open (mean >= on_min_mean_open); a dead-still
+    # listener (reaction shot) is left un-driven. Only trusted when the piece has
+    # enough finite open-prob samples (>= voice_on_min_scored_coverage); thin or
+    # absent data keeps the prior "on" so genuine speakers never regress.
+    voice_on_min_op_std: float = 0.02
+    voice_on_min_mean_open: float = 0.35
+    voice_on_min_scored_coverage: float = 0.5
     # SCRFD multi-face detect every N frames inside VAD×VSDLM fusion.
     asd_face_detect_stride: int = 3
     # Legacy AV-sync ASD (optional fallback when use_vsdlm=False).
@@ -1067,6 +1088,11 @@ class MuseTalkEngine:
                         shot_fill_ratio=cfg.vsdlm_shot_fill_ratio,
                         motion_op_std=cfg.vsdlm_motion_op_std,
                         motion_mar_std=cfg.vsdlm_motion_mar_std,
+                        track_agree_check=cfg.vsdlm_track_agree_check,
+                        track_agree_op_std=cfg.vsdlm_track_agree_op_std,
+                        track_agree_op_mean=cfg.vsdlm_track_agree_op_mean,
+                        track_agree_min_cov=cfg.vsdlm_track_agree_min_cov,
+                        track_agree_min_iou=cfg.vsdlm_track_agree_min_iou,
                     )
                     speaking_mask = speaking_mask[:video_num]
                     logger.info(
@@ -1532,6 +1558,9 @@ class MuseTalkEngine:
                     same_speaker_thr=cfg.voice_same_speaker_thr,
                     presence_floor=cfg.voice_presence_floor,
                     piece_min_sec=cfg.voice_piece_min_sec,
+                    on_min_op_std=cfg.voice_on_min_op_std,
+                    on_min_mean_open=cfg.voice_on_min_mean_open,
+                    min_scored_coverage=cfg.voice_on_min_scored_coverage,
                 )
                 off_iv = vr.get("off") or []
                 on_iv = vr.get("on") or []

@@ -155,6 +155,9 @@ def plan_voice_reassign(
     same_speaker_thr: float = 0.40,
     presence_floor: float = 0.50,
     piece_min_sec: float = 0.50,
+    on_min_op_std: float = 0.02,
+    on_min_mean_open: float = 0.35,
+    min_scored_coverage: float = 0.5,
 ) -> dict:
     """Full re-assignment plan on the task's ORIGINAL per-sentence spans.
 
@@ -182,6 +185,8 @@ def plan_voice_reassign(
             spans, C, frame_tracks, open_probs, coord_list, shot_ids,
             fps=fps, same_speaker_thr=same_speaker_thr,
             presence_floor=presence_floor, piece_min_sec=piece_min_sec,
+            on_min_op_std=on_min_op_std, on_min_mean_open=on_min_mean_open,
+            min_scored_coverage=min_scored_coverage,
         )
     except Exception:  # pragma: no cover - never break the run
         return empty

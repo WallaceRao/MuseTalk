@@ -160,6 +160,30 @@ def _load_service_config() -> ServiceConfig:
     if shot_fill is not None:
         config.vsdlm_shot_fill_ratio = max(0.0, min(1.0, float(shot_fill)))
 
+    # Track-agreement cross-check: veto MuseTalk primary false-positives (a
+    # closed mouth read as open) by requiring the independent SCRFD track scorer
+    # to agree. Off unless MUSETALK_VSDLM_TRACK_AGREE=1.
+    ta = os.environ.get("MUSETALK_VSDLM_TRACK_AGREE")
+    if ta is not None:
+        config.vsdlm_track_agree_check = ta.strip().lower() in {
+            "1",
+            "true",
+            "yes",
+            "on",
+        }
+    ta_opstd = os.environ.get("MUSETALK_VSDLM_TRACK_AGREE_OP_STD")
+    if ta_opstd is not None:
+        config.vsdlm_track_agree_op_std = max(0.0, float(ta_opstd))
+    ta_opmean = os.environ.get("MUSETALK_VSDLM_TRACK_AGREE_OP_MEAN")
+    if ta_opmean is not None:
+        config.vsdlm_track_agree_op_mean = max(0.0, float(ta_opmean))
+    ta_cov = os.environ.get("MUSETALK_VSDLM_TRACK_AGREE_MIN_COV")
+    if ta_cov is not None:
+        config.vsdlm_track_agree_min_cov = max(0.0, min(1.0, float(ta_cov)))
+    ta_iou = os.environ.get("MUSETALK_VSDLM_TRACK_AGREE_MIN_IOU")
+    if ta_iou is not None:
+        config.vsdlm_track_agree_min_iou = max(0.0, float(ta_iou))
+
     use_vad_fusion = os.environ.get("MUSETALK_USE_VAD_FUSION")
     if use_vad_fusion is not None:
         config.use_vad_fusion = use_vad_fusion.strip().lower() in {

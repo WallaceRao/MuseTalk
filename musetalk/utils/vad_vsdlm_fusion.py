@@ -687,6 +687,9 @@ def compute_voice_reassign_intervals(
     presence_floor: float = 0.50,
     piece_min_sec: float = 0.50,
     talk_open_thr: float = 0.5,
+    on_min_op_std: float = 0.02,
+    on_min_mean_open: float = 0.35,
+    min_scored_coverage: float = 0.5,
 ) -> dict:
     """Greedy re-assignment for the ONLY case we touch: a face fed >=2 sentences.
 
@@ -796,10 +799,36 @@ def compute_voice_reassign_intervals(
         if f is None:
             off.append((a, b))  # voice is NOT this shot's face -> stop driving it
             diag.append(("seg%d" % pc["si"], "%.2f-%.2f" % (a / fps, b / fps), "SKIP"))
-        else:
-            on.append((a, b))   # drive the (already correct per-shot) coord face
-            diag.append(("seg%d" % pc["si"], "%.2f-%.2f" % (a / fps, b / fps),
-                         "t%d" % f))
+            continue
+        # Visual re-check: a face may dominate a shot and voiceprint-match a
+        # sentence yet be a silent listener (reaction shot). Identity/anchor
+        # logic cannot tell those apart when the face appears in only one
+        # sentence (its anchor trivially == si), so require real mouth motion.
+        # "Talking" == the mouth MOVES (open-prob std, mirroring the production
+        # lip-motion gate) OR is held clearly OPEN (open-prob mean). A silent
+        # listener scores ~0 on both (e.g. t21 std .002/mean .002); a quiet or
+        # crying speaker still shows motion (e.g. t14 std .145/mean .118), which
+        # an absolute open-fraction threshold would wrongly drop. open_probs are
+        # NaN where VSDLM never scored the crop, so we only trust the verdict
+        # with enough FINITE samples (>= min_scored_coverage); thin/absent data
+        # keeps the prior behaviour (emit on) to avoid regressing unseen faces.
+        pr = open_probs.get(f) if open_probs else None
+        if pr and (b - a) > 0:
+            vals = [pr[i] for i in range(a, b)
+                    if i < len(pr) and np.isfinite(pr[i])]
+            coverage = len(vals) / float(b - a)
+            if len(vals) >= 3 and coverage >= min_scored_coverage:
+                arr = np.asarray(vals, dtype=np.float64)
+                op_std, op_mean = float(arr.std()), float(arr.mean())
+                if op_std < on_min_op_std and op_mean < on_min_mean_open:
+                    off.append((a, b))  # measured silent listener -> leave lips shut
+                    diag.append(("seg%d" % pc["si"], "%.2f-%.2f" % (a / fps, b / fps),
+                                 "SKIP(mouth std%.3f mean%.2f cov%.0f%%)" % (
+                                     op_std, op_mean, 100 * coverage)))
+                    continue
+        on.append((a, b))   # drive the (already correct per-shot) coord face
+        diag.append(("seg%d" % pc["si"], "%.2f-%.2f" % (a / fps, b / fps),
+                     "t%d" % f))
     return {"off": off, "on": on, "diag": diag, "conflict_faces": sorted(conflict_faces)}
 
 
@@ -827,6 +856,11 @@ def build_fused_speaking_mask(
     enable_shot_fill: bool = True,
     motion_op_std: float = 0.0,
     motion_mar_std: float = 0.0,
+    track_agree_check: bool = False,
+    track_agree_op_std: float = 0.02,
+    track_agree_op_mean: float = 0.35,
+    track_agree_min_cov: float = 0.5,
+    track_agree_min_iou: float = 0.3,
 ) -> Tuple[List[bool], dict]:
     """VAD ∩ lip-motion on the MuseTalk primary face.
 
@@ -843,6 +877,7 @@ def build_fused_speaking_mask(
     """
     from musetalk.utils.active_speaker import detect_shot_ids
     from musetalk.utils.vad_client import segments_to_frame_mask
+    from musetalk.utils.preprocessing import _bbox_iou
 
     n = len(frame_list)
     fps = float(fps) if fps and fps > 0 else 25.0
@@ -872,6 +907,12 @@ def build_fused_speaking_mask(
         shot_ids=shot_ids,
         only_multiface_frames=False,
     )
+    # Snapshot the *pure* per-track VSDLM open-prob before the MuseTalk primary
+    # dual-crop is merged on top. The primary crop is higher quality on that one
+    # face but can false-positive a closed mouth as open (op~0.7); the SCRFD
+    # track scorer is an independent second opinion used by the track-agreement
+    # cross-check below to veto such primary false positives.
+    track_open_pure = {tid: list(pr) for tid, pr in open_probs.items()}
 
     # MuseTalk primary: dual-crop + MAR soft-closed (higher quality on that face).
     primary_open = vsdlm_detector.score_open_probs(
@@ -976,6 +1017,89 @@ def build_fused_speaking_mask(
                 motion_op_std,
                 motion_mar_std,
                 before_motion,
+                sum(primary_visual),
+                n,
+            )
+
+        # Track-agreement cross-check (primary false-positive veto). The primary
+        # dual-crop op can read a *closed* mouth as open (op>=0.5) while an
+        # independent scorer on the SAME face disagrees. For each gated run, bind
+        # coord_list to the best-IoU SCRFD track and measure that track's *pure*
+        # VSDLM open-prob motion; if the independent scorer shows NO mouth motion
+        # (op_std<bar AND op_mean<floor) across the run, the primary reading is a
+        # false positive and the whole run is vetoed. This reuses the same
+        # calibrated motion rule as the voice-reassign re-check -- absolute track
+        # op is unreliable (even a quiet speaker's op_mean is only ~0.12), so a
+        # motion test is what separates a real talker (op_std~0.1+) from a silent
+        # listener (op_std~0.00). Runs whose face has no boundable/finite track
+        # fall back to trusting the primary, so single-face cases are never vetoed.
+        if track_agree_check:
+            def _bind_track(i):
+                cb = coord_list[i]
+                if cb == coord_placeholder:
+                    return None
+                tracks_i = frame_tracks[i] if i < len(frame_tracks) else {}
+                best_tid, best_iou = None, track_agree_min_iou
+                for tid, bbox in tracks_i.items():
+                    iou = _bbox_iou(cb[:4], bbox[:4])
+                    if iou >= best_iou:
+                        best_iou, best_tid = iou, tid
+                return best_tid
+
+            vetoed_frames = 0
+            n_runs = n_veto_runs = 0
+            i = 0
+            while i < n:
+                if not primary_visual[i]:
+                    i += 1
+                    continue
+                j = i
+                while j < n and primary_visual[j]:
+                    j += 1
+                n_runs += 1
+                vals = []
+                for k in range(i, j):
+                    tid = _bind_track(k)
+                    if tid is None:
+                        continue
+                    tr = track_open_pure.get(tid)
+                    if tr and k < len(tr) and np.isfinite(tr[k]):
+                        vals.append(float(tr[k]))
+                cov = len(vals) / float(j - i)
+                if len(vals) >= 3 and cov >= track_agree_min_cov:
+                    arr = np.asarray(vals, dtype=np.float64)
+                    t_std, t_mean = float(arr.std()), float(arr.mean())
+                    veto = (t_std < track_agree_op_std
+                            and t_mean < track_agree_op_mean)
+                    logger.debug(
+                        "  track-agree run [%d,%d] (%.2f-%.2fs) n=%d cov=%.2f "
+                        "track_op std=%.3f mean=%.3f -> %s",
+                        i, j, i / fps, j / fps, len(vals), cov,
+                        t_std, t_mean, "VETO" if veto else "keep",
+                    )
+                    if veto:
+                        for k in range(i, j):
+                            primary_visual[k] = False
+                        vetoed_frames += j - i
+                        n_veto_runs += 1
+                else:
+                    logger.debug(
+                        "  track-agree run [%d,%d] (%.2f-%.2fs) n=%d cov=%.2f "
+                        "-> keep (insufficient track samples)",
+                        i, j, i / fps, j / fps, len(vals), cov,
+                    )
+                i = j
+            logger.info(
+                "Track-agreement check (track op_std<%.3f & mean<%.2f vetoes run; "
+                "min_iou=%.2f min_cov=%.2f): runs=%d vetoed_runs=%d "
+                "vetoed_frames=%d primary_visual=%d/%d",
+                track_agree_op_std,
+                track_agree_op_mean,
+                track_agree_min_iou,
+                track_agree_min_cov,
+                n_runs,
+                n_veto_runs,
+                vetoed_frames,
                 sum(primary_visual),
                 n,
             )

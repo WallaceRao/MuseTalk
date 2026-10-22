@@ -195,6 +195,11 @@ class ServiceConfig:
     # silence so original talking mouths can close on silent reference audio.
     # Disabled: off-screen speech inside a single-face shot was being synced.
     lipsync_single_face_include_silence: bool = False
+    # Audio-silent but visually-talking frames (tail + inter-sentence pauses) are
+    # added to lipsync coverage so silent audio drives the mouth closed instead of
+    # falling back to the original talking-mouth frames. Requires vad_fusion.
+    # Kill-switch env: MUSETALK_CLOSE_MOUTH_ON_SILENCE.
+    lipsync_close_mouth_on_silence: bool = False
     # Contiguous speaking (post-dilate) required inside a shot before expanding
     # lipsync to the whole shot. Filters brief VSDLM false positives
     # (e.g. ~19/33/46/54/93s). 1.5s is stricter than V1's 1.1s (drops ~20s FP expands).
@@ -1389,6 +1394,51 @@ class MuseTalkEngine:
                         fill_meta.get("skipped_multi_face", 0),
                         fill_meta["skipped_non_primary"],
                         fill_meta["skipped_no_speak"],
+                    )
+
+                if (
+                    cfg.lipsync_close_mouth_on_silence
+                    and fusion_meta is not None
+                    and speaking_mask is not None
+                ):
+                    from musetalk.utils.active_speaker import (
+                        expand_speaking_mask_close_silence,
+                    )
+
+                    valid_face_cm = [
+                        b != coord_placeholder for b in coord_list[:video_num]
+                    ]
+                    pv = list(fusion_meta.get("primary_visual") or [])[:video_num]
+                    ov = list(
+                        fusion_meta.get("other_visual") or [False] * video_num
+                    )[:video_num]
+                    cm_shot_ids = (
+                        list(fusion_meta["shot_ids"])[:video_num]
+                        if fusion_meta.get("shot_ids") is not None
+                        else None
+                    )
+                    before_cm = sum(speaking_mask)
+                    speaking_mask, cm_meta = expand_speaking_mask_close_silence(
+                        speaking_mask,
+                        primary_visual=pv,
+                        other_visual=ov,
+                        valid_face=valid_face_cm,
+                        shot_ids=cm_shot_ids,
+                        assigned_segments=fusion_meta.get("assigned_segments"),
+                        primary_track_id=fusion_meta.get("primary_track_id"),
+                        fps=fps,
+                    )
+                    speaking_frames = sum(speaking_mask)
+                    logger.info(
+                        "Close-mouth-on-silence: +%d frames %d \u2192 %d/%d "
+                        "(no_shot_speech=%d, other_visual=%d, non_primary_vad=%d)",
+                        cm_meta["close_silence_frames"],
+                        before_cm,
+                        speaking_frames,
+                        video_num,
+                        cm_meta["skipped_no_shot_speech"],
+                        cm_meta["skipped_other_visual"],
+                        cm_meta["skipped_non_primary_vad"],
                     )
             elif cfg.use_lr_asd and self.asd_detector is not None:
                 logger.info("Running LR-ASD active speaker detection")

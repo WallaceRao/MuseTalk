@@ -281,6 +281,15 @@ def _load_service_config() -> ServiceConfig:
             "on",
         }
 
+    close_mouth = os.environ.get("MUSETALK_CLOSE_MOUTH_ON_SILENCE")
+    if close_mouth is not None:
+        config.lipsync_close_mouth_on_silence = close_mouth.strip().lower() in {
+            "1",
+            "true",
+            "yes",
+            "on",
+        }
+
     shot_thr = os.environ.get("MUSETALK_SHOT_CUT_HIST_THRESHOLD")
     if shot_thr is not None:
         config.shot_cut_hist_threshold = float(shot_thr)

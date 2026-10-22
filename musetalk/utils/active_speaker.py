@@ -1396,6 +1396,191 @@ def expand_speaking_mask_same_speaker_shots(
     return out, meta
 
 
+def expand_speaking_mask_close_silence(
+    speaking_mask: Sequence[bool],
+    *,
+    primary_visual: Sequence[bool],
+    other_visual: Sequence[bool] | None = None,
+    valid_face: Sequence[bool] | None = None,
+    shot_ids: Sequence[int] | None = None,
+    assigned_segments: Sequence[Tuple[float, float, int]] | None = None,
+    primary_track_id: int | None = None,
+    fps: float = LR_ASD_FPS,
+) -> Tuple[List[bool], dict]:
+    """Add audio-silent but visually-talking frames to lipsync coverage.
+
+    The dubbing audio can be shorter than the on-screen talking (a 0-10s voice
+    over a 0-30s talking shot, or pauses between sentences). Those frames are
+    dropped by the VAD intersection, so the pipeline would fall back to the
+    original talking-mouth frames -> "mouth moves but no sound". Here we re-add
+    exactly those frames so lipsync runs on them with the (silent) audio feature
+    and drives the mouth closed.
+
+    A frame qualifies only when the primary face shows real lip motion
+    (``primary_visual``) yet is NOT already gated speaking (``speaking_mask``),
+    has a valid face, is not attributed to another visible speaker
+    (``other_visual``), does not sit inside a VAD segment assigned to a
+    non-primary speaker (guards off-screen voice), and lives in a shot that
+    contains at least one genuine speaking frame. When audio really is present
+    the VAD intersection already covers the frame, so this never fights the
+    sync path.
+    """
+    n = len(speaking_mask)
+    out = list(speaking_mask)
+    meta = {
+        "close_silence_frames": 0,
+        "skipped_no_shot_speech": 0,
+        "skipped_other_visual": 0,
+        "skipped_non_primary_vad": 0,
+    }
+    if n == 0:
+        return out, meta
+    if len(primary_visual) != n:
+        raise ValueError("primary_visual length must match speaking_mask")
+    if other_visual is not None and len(other_visual) != n:
+        raise ValueError("other_visual length must match speaking_mask")
+    if valid_face is not None and len(valid_face) != n:
+        raise ValueError("valid_face length must match speaking_mask")
+    if shot_ids is not None and len(shot_ids) != n:
+        raise ValueError("shot_ids length must match speaking_mask")
+
+    fps = float(fps) if fps and fps > 0 else LR_ASD_FPS
+
+    # Frames covered by a VAD segment assigned to a speaker other than the
+    # primary: audio energy from a different (possibly off-screen) voice. Leave
+    # those to the normal gate; never drive them closed here.
+    non_primary_vad = [False] * n
+    if assigned_segments and primary_track_id is not None:
+        for a, b, spk in assigned_segments:
+            if int(spk) == int(primary_track_id):
+                continue
+            i0 = max(0, int(float(a) * fps))
+            i1 = min(n, int(round(float(b) * fps)))
+            for i in range(i0, i1):
+                non_primary_vad[i] = True
+
+    # Only extend within shots that already contain a real (audio) speaking
+    # frame, so an entirely silent shot is never woken.
+    shot_has_speech: set[int] = set()
+    if shot_ids is not None:
+        for i, v in enumerate(speaking_mask):
+            if v:
+                shot_has_speech.add(int(shot_ids[i]))
+
+    added = 0
+    for i in range(n):
+        if out[i] or not primary_visual[i]:
+            continue
+        if valid_face is not None and not valid_face[i]:
+            continue
+        if other_visual is not None and other_visual[i]:
+            meta["skipped_other_visual"] += 1
+            continue
+        if non_primary_vad[i]:
+            meta["skipped_non_primary_vad"] += 1
+            continue
+        if shot_ids is not None and int(shot_ids[i]) not in shot_has_speech:
+            meta["skipped_no_shot_speech"] += 1
+            continue
+        out[i] = True
+        added += 1
+
+    meta["close_silence_frames"] = added
+    return out, meta
+
+
+def expand_speaking_mask_close_silence(
+    speaking_mask: Sequence[bool],
+    *,
+    primary_visual: Sequence[bool],
+    other_visual: Sequence[bool] | None = None,
+    valid_face: Sequence[bool] | None = None,
+    shot_ids: Sequence[int] | None = None,
+    assigned_segments: Sequence[Tuple[float, float, int]] | None = None,
+    primary_track_id: int | None = None,
+    fps: float = LR_ASD_FPS,
+) -> Tuple[List[bool], dict]:
+    """Add audio-silent but visually-talking frames to lipsync coverage.
+
+    The dubbing audio can be shorter than the on-screen talking (a 0-10s voice
+    over a 0-30s talking shot, or pauses between sentences). Those frames are
+    dropped by the VAD intersection, so the pipeline would fall back to the
+    original talking-mouth frames -> "mouth moves but no sound". Here we re-add
+    exactly those frames so lipsync runs on them with the (silent) audio feature
+    and drives the mouth closed.
+
+    A frame qualifies only when the primary face shows real lip motion
+    (primary_visual) yet is NOT already gated speaking (speaking_mask), has a
+    valid face, is not attributed to another visible speaker (other_visual),
+    does not sit inside a VAD segment assigned to a non-primary speaker (guards
+    off-screen voice), and lives in a shot that contains at least one genuine
+    speaking frame. When audio really is present the VAD intersection already
+    covers the frame, so this never fights the sync path.
+    """
+    n = len(speaking_mask)
+    out = list(speaking_mask)
+    meta = {
+        "close_silence_frames": 0,
+        "skipped_no_shot_speech": 0,
+        "skipped_other_visual": 0,
+        "skipped_non_primary_vad": 0,
+    }
+    if n == 0:
+        return out, meta
+    if len(primary_visual) != n:
+        raise ValueError("primary_visual length must match speaking_mask")
+    if other_visual is not None and len(other_visual) != n:
+        raise ValueError("other_visual length must match speaking_mask")
+    if valid_face is not None and len(valid_face) != n:
+        raise ValueError("valid_face length must match speaking_mask")
+    if shot_ids is not None and len(shot_ids) != n:
+        raise ValueError("shot_ids length must match speaking_mask")
+
+    fps = float(fps) if fps and fps > 0 else LR_ASD_FPS
+
+    # Frames covered by a VAD segment assigned to a speaker other than the
+    # primary: audio energy from a different (possibly off-screen) voice. Leave
+    # those to the normal gate; never drive them closed here.
+    non_primary_vad = [False] * n
+    if assigned_segments and primary_track_id is not None:
+        for a, b, spk in assigned_segments:
+            if int(spk) == int(primary_track_id):
+                continue
+            i0 = max(0, int(float(a) * fps))
+            i1 = min(n, int(round(float(b) * fps)))
+            for i in range(i0, i1):
+                non_primary_vad[i] = True
+
+    # Only extend within shots that already contain a real (audio) speaking
+    # frame, so an entirely silent shot is never woken.
+    shot_has_speech = set()
+    if shot_ids is not None:
+        for i, v in enumerate(speaking_mask):
+            if v:
+                shot_has_speech.add(int(shot_ids[i]))
+
+    added = 0
+    for i in range(n):
+        if out[i] or not primary_visual[i]:
+            continue
+        if valid_face is not None and not valid_face[i]:
+            continue
+        if other_visual is not None and other_visual[i]:
+            meta["skipped_other_visual"] += 1
+            continue
+        if non_primary_vad[i]:
+            meta["skipped_non_primary_vad"] += 1
+            continue
+        if shot_ids is not None and int(shot_ids[i]) not in shot_has_speech:
+            meta["skipped_no_shot_speech"] += 1
+            continue
+        out[i] = True
+        added += 1
+
+    meta["close_silence_frames"] = added
+    return out, meta
+
+
 def expand_speaking_mask_to_shots(
     speaking_mask: Sequence[bool],
     shot_ids: Sequence[int],

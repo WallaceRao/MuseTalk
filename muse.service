@@ -16,9 +16,27 @@ Environment=CUDA_VISIBLE_DEVICES=0
 # VRAM: expandable segments let the caching allocator grow/reclaim in place,
 # cutting fragmentation and held-but-unused reservations on this shared GPU.
 Environment=PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
-# V2 default: LatentSync 1.5 lipsync; set musetalk to roll back to V1 generator
+# Lip-sync generator backend. The deployed unit runs /home/ubuntu/system_startup/muse.sh,
+# which exports the same MUSETALK_* set below - keep the two in sync when tuning.
 Environment=MUSETALK_LIPSYNC_BACKEND=tbdub
 Environment=HF_ENDPOINT=https://hf-mirror.com
+# LatentSync model version if the backend rolls back: 1.6 (512, sharper) / 1.5 (256, faster)
+Environment=MUSETALK_LATENTSYNC_VERSION=1.5
+# Dubbing mouth-open gate: lower MAR bars to recover soft/crying speech.
+Environment=MUSETALK_VSDLM_SPEAK_MAR_THRESHOLD=0.08
+Environment=MUSETALK_VSDLM_SOFT_CLOSED_MAR=0.08
+# Loose lip-motion gate: kill frozen-open mouths (op_std OR mar_std must clear).
+Environment=MUSETALK_VSDLM_MOTION_OP_STD=0.02
+Environment=MUSETALK_VSDLM_MOTION_MAR_STD=0.015
+# Lower shot-fill ratio so motion-gated soft-speech shots still fill.
+Environment=MUSETALK_VSDLM_SHOT_FILL_RATIO=0.25
+# Merge adjacent synced runs when gap < 0.5s (12 frames @ 25fps); same shot AND same face.
+Environment=MUSETALK_LATENTSYNC_MERGE_GAP_FRAMES=12
+# Grow each VAD segment by 0.1s so the sync onset is not late.
+Environment=MUSETALK_VAD_PAD_SEC=0.1
+# Dub-silent but visually-talking frames join lipsync so silent audio closes the mouth
+# instead of falling back to the original talking-mouth plate.
+Environment=MUSETALK_CLOSE_MOUTH_ON_SILENCE=1
 
 ExecStart=/home/ubuntu/miniconda3/envs/heng/bin/uvicorn server:app --host 0.0.0.0 --port 8765
 ExecStop=/bin/kill -SIGTERM $MAINPID

@@ -25,6 +25,50 @@ def _load_service_config() -> ServiceConfig:
     if lipsync_backend:
         config.lipsync_backend = lipsync_backend.strip().lower()
 
+    # TBDub Student backend knobs (MUSETALK_LIPSYNC_BACKEND=tbdub, the default).
+    tbdub_repo = os.environ.get("MUSETALK_TBDUB_REPO")
+    if tbdub_repo:
+        config.tbdub_repo = tbdub_repo
+    tbdub_ckpt = os.environ.get("MUSETALK_TBDUB_CKPT_DIR")
+    if tbdub_ckpt:
+        config.tbdub_ckpt_dir = tbdub_ckpt
+    tbdub_steps = os.environ.get("MUSETALK_TBDUB_STEPS")
+    if tbdub_steps is not None:
+        config.tbdub_num_student_steps = max(1, int(tbdub_steps))
+    tbdub_sigma = os.environ.get("MUSETALK_TBDUB_SIGMA_SHIFT")
+    if tbdub_sigma is not None:
+        config.tbdub_sigma_shift = float(tbdub_sigma)
+    tbdub_seed = os.environ.get("MUSETALK_TBDUB_SEED")
+    if tbdub_seed is not None:
+        config.tbdub_seed = int(tbdub_seed)
+    tbdub_cpu_offload = os.environ.get("MUSETALK_TBDUB_CPU_OFFLOAD")
+    if tbdub_cpu_offload is not None:
+        config.tbdub_cpu_offload = tbdub_cpu_offload.strip().lower() in {
+            "1",
+            "true",
+            "yes",
+            "on",
+        }
+    tbdub_target_fps = os.environ.get("MUSETALK_TBDUB_TARGET_FPS")
+    if tbdub_target_fps is not None:
+        config.tbdub_target_fps = float(tbdub_target_fps)
+    tbdub_min_run = os.environ.get("MUSETALK_TBDUB_MIN_RUN_FRAMES")
+    if tbdub_min_run is not None:
+        config.tbdub_min_run_frames = max(0, int(tbdub_min_run))
+    tbdub_merge_gap = os.environ.get("MUSETALK_TBDUB_MERGE_GAP_FRAMES")
+    if tbdub_merge_gap is not None:
+        config.tbdub_merge_gap_frames = max(0, int(tbdub_merge_gap))
+    # CFG branch weights. NOTE: measured no-ops on the shipped Student model --
+    # TBDub's pipeline only reads them under `cfg_merge`, which is set to
+    # `not is_student` (False for Student, since guidance is distilled into the
+    # weights). Kept so a Teacher checkpoint can be swept without code changes.
+    tbdub_ref_cfg = os.environ.get("MUSETALK_TBDUB_REF_CFG_SCALE")
+    if tbdub_ref_cfg is not None:
+        config.tbdub_ref_cfg_scale = float(tbdub_ref_cfg)
+    tbdub_audio_cfg = os.environ.get("MUSETALK_TBDUB_AUDIO_CFG_SCALE")
+    if tbdub_audio_cfg is not None:
+        config.tbdub_audio_cfg_scale = float(tbdub_audio_cfg)
+
     # LatentSync model-version selector, evaluated at service startup: choose
     # the 1.6 (512, default) or the 1.5 (256, ~2.7x faster) UNet. Switching the
     # version swaps the unet config + checkpoint + whisper paths together; the

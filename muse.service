@@ -17,7 +17,7 @@ Environment=CUDA_VISIBLE_DEVICES=0
 # cutting fragmentation and held-but-unused reservations on this shared GPU.
 Environment=PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
 # V2 default: LatentSync 1.5 lipsync; set musetalk to roll back to V1 generator
-Environment=MUSETALK_LIPSYNC_BACKEND=latentsync
+Environment=MUSETALK_LIPSYNC_BACKEND=tbdub
 Environment=HF_ENDPOINT=https://hf-mirror.com
 
 ExecStart=/home/ubuntu/miniconda3/envs/heng/bin/uvicorn server:app --host 0.0.0.0 --port 8765

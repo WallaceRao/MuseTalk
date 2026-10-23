@@ -700,16 +700,19 @@ def get_landmark_and_bbox(
     return coords_list, frames
 
 
-def mouth_bbox_from_face(
+def _face_landmarks_for_bbox(
     frame: np.ndarray,
     face_bbox,
-    *,
-    detect_short_side: int = 720,
-) -> tuple | None:
-    """Run DWPose on one face box and return a tight lip bbox in original coords."""
+    detect_short_side: int,
+) -> "Optional[np.ndarray]":
+    """Run DWPose on one face box and return the 68 face points (original coords).
+
+    Points are in ibug order: 0-16 jaw contour, 17-26 brows/eyes, 27-35 nose,
+    36-47 irises, 48-67 lips (48/54 mouth corners, 60-64 inner upper lip,
+    65-67 + 60 inner lower lip). Returns None when nothing usable is detected.
+    """
     if frame is None or face_bbox is None or face_bbox == coord_placeholder:
         return None
-    h_orig, w_orig = frame.shape[:2]
     detect_frame, scale_x, scale_y = _resize_for_detection(frame, detect_short_side)
     h_det, w_det = detect_frame.shape[:2]
     face_det = (
@@ -732,14 +735,38 @@ def mouth_bbox_from_face(
     if keypoints is None or len(keypoints) == 0:
         return None
     face_land_mark = np.asarray(keypoints[0][23:91], dtype=np.float64)
+    if face_land_mark.shape[0] < 68 or not np.isfinite(face_land_mark).all():
+        return None
+    if scale_x != 1.0 or scale_y != 1.0:
+        face_land_mark = face_land_mark * np.array([scale_x, scale_y], dtype=np.float64)
+    return face_land_mark
+
+
+def face_landmarks_from_face(
+    frame: np.ndarray,
+    face_bbox,
+    *,
+    detect_short_side: int = 720,
+) -> "Optional[np.ndarray]":
+    """Public wrapper: 68 face landmarks of one frame in original coordinates."""
+    return _face_landmarks_for_bbox(frame, face_bbox, detect_short_side)
+
+
+def mouth_bbox_from_face(
+    frame: np.ndarray,
+    face_bbox,
+    *,
+    detect_short_side: int = 720,
+) -> tuple | None:
+    """Run DWPose on one face box and return a tight lip bbox in original coords."""
+    face_land_mark = _face_landmarks_for_bbox(frame, face_bbox, detect_short_side)
+    if face_land_mark is None:
+        return None
     mouth_det, _mar = _mouth_bbox_from_face_landmarks(face_land_mark)
     if mouth_det is None:
         return None
-    return _clamp_bbox(
-        _scale_bbox_to_original(mouth_det, scale_x, scale_y),
-        w_orig,
-        h_orig,
-    )
+    h_orig, w_orig = frame.shape[:2]
+    return _clamp_bbox(mouth_det, w_orig, h_orig)
     
 
 if __name__ == "__main__":

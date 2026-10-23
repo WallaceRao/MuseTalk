@@ -1,4 +1,5 @@
 import glob
+import json
 import logging
 import os
 import shutil
@@ -41,6 +42,25 @@ from musetalk.utils.active_speaker import (
 from musetalk.utils.vad_vsdlm_fusion import build_fused_speaking_mask
 from musetalk.utils import voiceprint as _voiceprint
 from musetalk.utils.yaw_gate import apply_yaw_hysteresis_gate
+
+_DEBUG_MASK_DIR = os.environ.get("MUSETALK_DEBUG_MASK_DIR", "")
+
+
+def _debug_dump_masks(stage: str, **masks) -> None:
+    """Env-gated per-stage mask dump (MUSETALK_DEBUG_MASK_DIR) for gate debugging."""
+    if not _DEBUG_MASK_DIR:
+        return
+    try:
+        os.makedirs(_DEBUG_MASK_DIR, exist_ok=True)
+        payload = {
+            name: [None if v is None else int(bool(v)) for v in seq]
+            for name, seq in masks.items()
+            if seq is not None
+        }
+        with open(os.path.join(_DEBUG_MASK_DIR, f"{stage}.json"), "w") as fh:
+            json.dump(payload, fh)
+    except Exception:
+        logger.debug("debug mask dump failed", exc_info=True)
 from musetalk.utils.audio_processor import AudioProcessor
 from musetalk.utils.blending import (
     blend_frames,
@@ -200,6 +220,12 @@ class ServiceConfig:
     # falling back to the original talking-mouth frames. Requires vad_fusion.
     # Kill-switch env: MUSETALK_CLOSE_MOUTH_ON_SILENCE.
     lipsync_close_mouth_on_silence: bool = False
+    # TBDub reproduces its reference frame very strongly and follows the audio
+    # weakly, so a dub-silent frame used to keep the plate's open mouth ("mouth
+    # moving with no sound"). That was never a model limitation and needs no pixel
+    # fix: our crop handed the model a face box whose lower half had been chopped
+    # off (see ``tbdub_backend.tbdub_square_boxes``), so it had no mouth to follow.
+    # With the crop fixed, silent dub audio closes the mouth on its own.
     # Contiguous speaking (post-dilate) required inside a shot before expanding
     # lipsync to the whole shot. Filters brief VSDLM false positives
     # (e.g. ~19/33/46/54/93s). 1.5s is stricter than V1's 1.1s (drops ~20s FP expands).
@@ -261,8 +287,9 @@ class ServiceConfig:
     max_concurrent_requests: int = 1
     # Optional per-slot GPU assignment, e.g. [0, 1]. Cycles when slots > len(gpu_ids).
     gpu_ids: Optional[List[int]] = None
-    # Lip generation backend: "latentsync" (V2 default) or "musetalk" (V1).
-    lipsync_backend: str = "latentsync"
+    # Lip generation backend: "tbdub" (TBDub Student, default) or "latentsync"
+    # (V2 legacy) or "musetalk" (V1).
+    lipsync_backend: str = "tbdub"
     latentsync_repo: str = "./third_party/LatentSync"
     # LatentSync 1.6: 512x512 face-aligned U-Net (stage2_512.yaml) + stable_syncnet.
     latentsync_unet_config: str = "./third_party/LatentSync/configs/unet/stage2_512.yaml"
@@ -303,6 +330,31 @@ class ServiceConfig:
     latentsync_seed: int = 1247
     # Drop LatentSync frames whose InsightFace box does not match MuseTalk primary.
     latentsync_primary_iou_min: float = 0.3
+    # TBDub Student backend (in-process; repo-sys.path import, no subprocess).
+    # Skips TBDub's MediaPipe preprocessing: MuseTalk's primary-face coord_list
+    # boxes drive TBDub's own square-crop alignment, and each speaking run is
+    # resampled src-fps <-> 25fps inside the backend (TBDub is 25fps-hardwired).
+    tbdub_repo: str = "./third_party/TBDub"
+    # Empty -> <tbdub_repo>/checkpoints.
+    tbdub_ckpt_dir: str = ""
+    # Official Student settings (inference.py): 2 distilled steps, sigma_shift
+    # 1.0, motion chained via latents, seed 42 (+clip index).
+    tbdub_num_student_steps: int = 2
+    tbdub_sigma_shift: float = 1.0
+    tbdub_seed: int = 42
+    tbdub_motion_from_latents: bool = True
+    # Park DiT weights in host RAM between uses so the engine's own models can
+    # stay resident on a shared GPU (~15GB peak vs ~28GB resident).
+    tbdub_cpu_offload: bool = True
+    tbdub_ref_cfg_scale: float = 2.0
+    tbdub_audio_cfg_scale: float = 6.0
+    # TBDub-native generation fps (audio addressing + 77-frame clips are built
+    # around this); per-run output is re-timed back onto the source fps.
+    tbdub_target_fps: float = 25.0
+    # Run layout: drop micro-runs / close tiny gaps (same semantics as the
+    # LatentSync knobs; per-clip fixed overhead is large for the DiT pipeline).
+    tbdub_min_run_frames: int = 8
+    tbdub_merge_gap_frames: int = 4
     # Visual gender gate: FairFace ONNX (low conf → unclear, keep speaking frames).
     fairface_model_path: str = "./models/fairface/fairface.onnx"
     fairface_scrfd_path: str = "./models/scrfd/det_10g.onnx"
@@ -325,6 +377,18 @@ class ServiceConfig:
     # active block, which is byte-identical to the global ramp (runs are separated
     # by >=1 non-speaking frame). Kill-switch: set False to restore the serial path.
     stream_composite: bool = True
+
+
+def _mouth_boxes_kwargs(mouth_coord_list, backend) -> dict:
+    """TBDub crops its own reference out of the primary face box, and the box it is
+    given is tall (DWPose) while TBDub squares it by MIN side anchored top-left -
+    which drops the mouth out of the crop. The backend fixes the geometry but needs
+    the tight lip boxes to guarantee the mouth is inside, so pass them to it; a
+    purely audio-driven backend like LatentSync never crops and gets nothing.
+    """
+    if not mouth_coord_list or not getattr(backend, "supports_mouth_boxes", False):
+        return {}
+    return {"mouth_boxes": list(mouth_coord_list)}
 
 
 def _latentsync_paste_params(
@@ -394,6 +458,31 @@ class MuseTalkEngine:
             "ls",
             "v2",
         }
+
+    @property
+    def _use_tbdub(self) -> bool:
+        return str(self.config.lipsync_backend).strip().lower() in {
+            "tbdub",
+            "tbdub_student",
+            "student",
+        }
+
+    @property
+    def _use_backend(self) -> bool:
+        """Any full-frame lipsync backend (LatentSync / TBDub) vs MuseTalk v1.
+
+        Both backends return full frames keyed by frame index, so every
+        composite / whisper-skip / CodeFormer decision treats them alike.
+        """
+        return self._use_latentsync or self._use_tbdub
+
+    @property
+    def _backend_name(self) -> str:
+        if self._use_tbdub:
+            return "tbdub"
+        if self._use_latentsync:
+            return "latentsync"
+        return "musetalk"
 
     def _get_face_parser(self):
         """FaceParsing (BiSeNet) for blend masks and mouth-occlusion gating."""
@@ -488,7 +577,7 @@ class MuseTalkEngine:
 
     def _load_models(self) -> None:
         cfg = self.config
-        self.latentsync = None
+        self.lipsync = None
         self.vae = None
         self.unet = None
         self.pe = None
@@ -498,12 +587,36 @@ class MuseTalkEngine:
         self.weight_dtype = torch.float16 if cfg.use_float16 else torch.float32
         self.timesteps = torch.tensor([0], device=self.device)
 
-        if self._use_latentsync:
+        if self._use_tbdub:
+            from musetalk.service.tbdub_backend import TBDubBackend
+
+            logger.info("Initializing TBDub Student lipsync backend on %s", self.device)
+            _backend_load_t0 = time.perf_counter()
+            self.lipsync = TBDubBackend(
+                device=self.device,
+                repo_root=cfg.tbdub_repo,
+                checkpoint_dir=cfg.tbdub_ckpt_dir,
+                num_student_steps=cfg.tbdub_num_student_steps,
+                sigma_shift=cfg.tbdub_sigma_shift,
+                seed=cfg.tbdub_seed,
+                motion_from_latents=cfg.tbdub_motion_from_latents,
+                cpu_offload=cfg.tbdub_cpu_offload,
+                ref_cfg_scale=cfg.tbdub_ref_cfg_scale,
+                audio_cfg_scale=cfg.tbdub_audio_cfg_scale,
+                target_fps=cfg.tbdub_target_fps,
+                min_run_frames=cfg.tbdub_min_run_frames,
+                merge_gap_frames=cfg.tbdub_merge_gap_frames,
+            )
+            logger.info(
+                "[timing] tbdub backend init: %.3fs (weights lazy-load on first use)",
+                time.perf_counter() - _backend_load_t0,
+            )
+        elif self._use_latentsync:
             from musetalk.service.latentsync_backend import LatentSyncBackend
 
             logger.info("Loading LatentSync 1.6 lipsync backend on %s", self.device)
             _backend_load_t0 = time.perf_counter()
-            self.latentsync = LatentSyncBackend(
+            self.lipsync = LatentSyncBackend(
                 device=self.device,
                 repo_root=cfg.latentsync_repo,
                 unet_config=cfg.latentsync_unet_config,
@@ -591,8 +704,8 @@ class MuseTalkEngine:
             )
 
         self.codeformer = None
-        # CodeFormer restores MuseTalk face crops; skip for LatentSync full-frame output.
-        if cfg.use_codeformer and not self._use_latentsync:
+        # CodeFormer restores MuseTalk face crops; skip for full-frame backend output.
+        if cfg.use_codeformer and not self._use_backend:
             try:
                 from musetalk.utils.codeformer_restorer import CodeFormerRestorer
 
@@ -611,7 +724,7 @@ class MuseTalkEngine:
                 self.codeformer = None
         logger.info(
             "Lip-sync engine ready (backend=%s)",
-            "latentsync" if self._use_latentsync else "musetalk",
+            self._backend_name,
         )
 
     @torch.no_grad()
@@ -916,7 +1029,7 @@ class MuseTalkEngine:
         worker.start()
         full_frame_by_index: dict = {}
         try:
-            full_frame_by_index = self.latentsync.lipsync_indices(
+            full_frame_by_index = self.lipsync.lipsync_indices(
                 frame_list=frame_list,
                 audio_path=audio_path,
                 infer_indices=infer_indices,
@@ -925,6 +1038,7 @@ class MuseTalkEngine:
                 coord_list=coord_list,
                 primary_iou_min=cfg.latentsync_primary_iou_min,
                 stream_cb=lambda s, e, rf: q.put((s, e, rf)),
+                **_mouth_boxes_kwargs(mouth_coord_list, self.lipsync),
             )
         finally:
             q.put(None)
@@ -1019,7 +1133,7 @@ class MuseTalkEngine:
             _stage("decode")
 
             whisper_chunks = None
-            if not self._use_latentsync:
+            if not self._use_backend:
                 whisper_input_features, librosa_length = self.audio_processor.get_audio_feature(
                     audio_path
                 )
@@ -1067,6 +1181,7 @@ class MuseTalkEngine:
             speaking_mask = None
             speaking_frames = 0
             fusion_meta = None
+            yaw_list = None
             if cfg.use_vsdlm and self.vsdlm_detector is not None:
                 if cfg.use_vad_fusion:
                     logger.info(
@@ -1334,6 +1449,7 @@ class MuseTalkEngine:
                     cfg.asd_mask_dilate,
                     cfg.vsdlm_min_speak_duration_sec,
                 )
+                _debug_dump_masks("gate_expand", speaking_mask=speaking_mask)
 
                 if (
                     cfg.lipsync_same_speaker_fill_shot
@@ -1431,14 +1547,21 @@ class MuseTalkEngine:
                     speaking_frames = sum(speaking_mask)
                     logger.info(
                         "Close-mouth-on-silence: +%d frames %d \u2192 %d/%d "
-                        "(no_shot_speech=%d, other_visual=%d, non_primary_vad=%d)",
+                        "(no_shot_speech=%d, other_visual_seen=%d, non_primary_vad=%d)",
                         cm_meta["close_silence_frames"],
                         before_cm,
                         speaking_frames,
                         video_num,
                         cm_meta["skipped_no_shot_speech"],
-                        cm_meta["skipped_other_visual"],
+                        cm_meta["seen_other_visual"],
                         cm_meta["skipped_non_primary_vad"],
+                    )
+                    _debug_dump_masks(
+                        "close_silence",
+                        speaking_mask=speaking_mask,
+                        primary_visual=pv,
+                        other_visual=ov,
+                        valid_face=valid_face_cm,
                     )
             elif cfg.use_lr_asd and self.asd_detector is not None:
                 logger.info("Running LR-ASD active speaker detection")
@@ -1644,6 +1767,7 @@ class MuseTalkEngine:
                         "Voice re-assign applied: -%d +%d frames -> %d/%d speaking",
                         turned_off, turned_on, speaking_frames, _m_len,
                     )
+                _debug_dump_masks("voice_reassign", speaking_mask=speaking_mask)
 
             infer_indices = []
             frame_h0, frame_w0 = frame_list[0].shape[:2]
@@ -1719,6 +1843,9 @@ class MuseTalkEngine:
                             yaw_meta["entered_off"],
                             yaw_meta["reentered_on"],
                         )
+                    _debug_dump_masks(
+                        "yaw_gate", speaking_mask=speaking_mask, yaw=yaw_list
+                    )
 
             logger.info("[timing] gate.yaw: %.3fs", time.perf_counter() - _t_gate_yaw)
 
@@ -1820,9 +1947,9 @@ class MuseTalkEngine:
             temp_vid_path = os.path.join(temp_dir, f"temp_{output_basename}.mp4")
             _stream_composited = False
             _stage("speaking-gate")
-            if infer_indices and self._use_latentsync:
-                if self.latentsync is None:
-                    raise RuntimeError("LatentSync backend is not loaded")
+            if infer_indices and self._use_backend:
+                if self.lipsync is None:
+                    raise RuntimeError("Lipsync backend is not loaded")
                 if cfg.stream_composite:
                     full_frame_by_index, lipsync_frames = self._latentsync_streaming(
                         cfg=cfg,
@@ -1841,7 +1968,7 @@ class MuseTalkEngine:
                     )
                     _stream_composited = True
                 else:
-                    full_frame_by_index = self.latentsync.lipsync_indices(
+                    full_frame_by_index = self.lipsync.lipsync_indices(
                         frame_list=frame_list,
                         audio_path=audio_path,
                         infer_indices=infer_indices,
@@ -1849,6 +1976,7 @@ class MuseTalkEngine:
                         temp_dir=os.path.join(temp_dir, "latentsync"),
                         coord_list=coord_list,
                         primary_iou_min=cfg.latentsync_primary_iou_min,
+                        **_mouth_boxes_kwargs(mouth_coord_list, self.lipsync),
                     )
             elif infer_indices:
                 logger.info(
@@ -1905,7 +2033,7 @@ class MuseTalkEngine:
 
             # LatentSync re-detects the largest face per frame; paste only the
             # MuseTalk primary bbox so secondary faces never flash.
-            if self._use_latentsync and not _stream_composited:
+            if self._use_backend and not _stream_composited:
                 active_mask = [i in full_frame_by_index for i in range(video_num)]
                 blend_alphas = compute_segment_blend_alphas(
                     active_mask, ramp_frames=cfg.blend_ramp_frames
@@ -1975,7 +2103,7 @@ class MuseTalkEngine:
                             combine_frame = blend_frames(ori_frame, combine_frame, alpha)
                         lipsync_frames += 1
                         writer.write(combine_frame)
-            elif not self._use_latentsync:
+            elif not self._use_backend:
                 # Batch CodeFormer restore before the per-frame blend loop.
                 # Stride reuse must stay on the same face track: if bbox IoU drops or
                 # speaking frames are far apart, force a fresh restore (never paste the

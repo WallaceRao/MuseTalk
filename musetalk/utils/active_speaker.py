@@ -1430,7 +1430,7 @@ def expand_speaking_mask_close_silence(
     meta = {
         "close_silence_frames": 0,
         "skipped_no_shot_speech": 0,
-        "skipped_other_visual": 0,
+        "seen_other_visual": 0,
         "skipped_non_primary_vad": 0,
     }
     if n == 0:
@@ -1474,8 +1474,18 @@ def expand_speaking_mask_close_silence(
         if valid_face is not None and not valid_face[i]:
             continue
         if other_visual is not None and other_visual[i]:
-            meta["skipped_other_visual"] += 1
-            continue
+            # Diagnostics only: count but do NOT veto. Every candidate here
+            # already has primary_visual[i] (the primary really shows lip
+            # motion), and the dub audio is silent — nobody is audible, so
+            # driving the primary's mouth closed stays A/V-correct even when
+            # another track is flagged speaking. In practice the flag is
+            # unreliable exactly where close-silence matters: OTS shots flag
+            # a back-to-camera listener, and fast head turns duplicate the
+            # primary into a second track, which blocked the fix at 5.6-6.0s
+            # in en.mp4 while the primary was clearly talking. Genuine
+            # off-screen voices stay protected by the non_primary_vad and
+            # shot_has_speech guards below.
+            meta["seen_other_visual"] += 1
         if non_primary_vad[i]:
             meta["skipped_non_primary_vad"] += 1
             continue
@@ -1522,7 +1532,7 @@ def expand_speaking_mask_close_silence(
     meta = {
         "close_silence_frames": 0,
         "skipped_no_shot_speech": 0,
-        "skipped_other_visual": 0,
+        "seen_other_visual": 0,
         "skipped_non_primary_vad": 0,
     }
     if n == 0:
@@ -1566,8 +1576,18 @@ def expand_speaking_mask_close_silence(
         if valid_face is not None and not valid_face[i]:
             continue
         if other_visual is not None and other_visual[i]:
-            meta["skipped_other_visual"] += 1
-            continue
+            # Diagnostics only: count but do NOT veto. Every candidate here
+            # already has primary_visual[i] (the primary really shows lip
+            # motion), and the dub audio is silent — nobody is audible, so
+            # driving the primary's mouth closed stays A/V-correct even when
+            # another track is flagged speaking. In practice the flag is
+            # unreliable exactly where close-silence matters: OTS shots flag
+            # a back-to-camera listener, and fast head turns duplicate the
+            # primary into a second track, which blocked the fix at 5.6-6.0s
+            # in en.mp4 while the primary was clearly talking. Genuine
+            # off-screen voices stay protected by the non_primary_vad and
+            # shot_has_speech guards below.
+            meta["seen_other_visual"] += 1
         if non_primary_vad[i]:
             meta["skipped_non_primary_vad"] += 1
             continue

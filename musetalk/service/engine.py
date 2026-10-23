@@ -1935,7 +1935,7 @@ class MuseTalkEngine:
                 bbox = coord_list[i]
                 if bbox == coord_placeholder:
                     continue
-                x1, y1, x2, y2 = bbox
+                x1, y1, x2, y2 = (int(v) for v in bbox)
                 if cfg.version == "v15":
                     y2 = min(y2 + cfg.extra_margin, frame_list[i].shape[0])
                 if x2 <= x1 or y2 <= y1:
@@ -1995,7 +1995,7 @@ class MuseTalkEngine:
                 infer_whisper = []
                 for i in infer_indices:
                     bbox = coord_list[i]
-                    x1, y1, x2, y2 = bbox
+                    x1, y1, x2, y2 = (int(v) for v in bbox)
                     if cfg.version == "v15":
                         y2 = min(y2 + cfg.extra_margin, frame_list[i].shape[0])
                     crop_frame = frame_list[i][y1:y2, x1:x2]

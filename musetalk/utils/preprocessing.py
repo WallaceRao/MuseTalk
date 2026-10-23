@@ -124,8 +124,10 @@ def _resize_for_detection(frame, detect_short_side=720):
 
 
 def _scale_bbox_to_original(bbox, scale_x, scale_y):
-    if bbox == coord_placeholder or (scale_x == 1.0 and scale_y == 1.0):
+    if bbox == coord_placeholder:
         return bbox
+    # Always emit integer coords: when no downscale happens (scale==1.0) the raw
+    # SCRFD float bbox would otherwise leak through and break numpy slicing.
     x1, y1, x2, y2 = bbox
     return (
         int(round(x1 * scale_x)),

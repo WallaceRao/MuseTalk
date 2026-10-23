@@ -338,6 +338,28 @@ def _load_service_config() -> ServiceConfig:
     if shot_thr is not None:
         config.shot_cut_hist_threshold = float(shot_thr)
 
+    # Yaw gate. Defaults (off=65/on=57) already sit where InsightFace's saturating
+    # yaw actually separates a readable face from a profile; these exist so a
+    # deployment can retune without a code change. ``apply_yaw_hysteresis_gate``
+    # clamps on_deg down to off_deg when the pair is inverted.
+    yaw_gate = os.environ.get("MUSETALK_LIPSYNC_YAW_GATE")
+    if yaw_gate is not None:
+        config.lipsync_yaw_gate = yaw_gate.strip().lower() in {
+            "1",
+            "true",
+            "yes",
+            "on",
+        }
+    yaw_off = os.environ.get("MUSETALK_LIPSYNC_YAW_OFF_DEG")
+    if yaw_off is not None:
+        config.lipsync_yaw_off_deg = max(0.0, float(yaw_off))
+    yaw_on = os.environ.get("MUSETALK_LIPSYNC_YAW_ON_DEG")
+    if yaw_on is not None:
+        config.lipsync_yaw_on_deg = max(0.0, float(yaw_on))
+    yaw_stride = os.environ.get("MUSETALK_LIPSYNC_YAW_STRIDE")
+    if yaw_stride is not None:
+        config.lipsync_yaw_stride = max(0, int(yaw_stride))
+
     return config
 
 

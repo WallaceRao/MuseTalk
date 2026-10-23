@@ -169,8 +169,6 @@ class TBDubBackend:
     # the crop geometry has to be told where the mouth is (see tbdub_square_boxes)
     supports_mouth_boxes = True
 
-    _crop_dump_index = 0
-
     def __init__(
         self,
         *,
@@ -709,32 +707,6 @@ class TBDubBackend:
         )
 
         # ---- paste back at TBDub-native fps ------------------------------
-        # Debug hook: dump [plate crop | generated crop] side by side with the run
-        # audio, so "the mouth does not follow the dub" can be attributed either to
-        # the generator (columns match each other) or to our composite (they differ
-        # but the output still shows the plate). Env: MUSETALK_TBDUB_CROP_DUMP=DIR
-        dump_dir = os.environ.get("MUSETALK_TBDUB_CROP_DUMP", "").strip()
-        if dump_dir:
-            from video_utils import (  # TBDub repo
-                concat_pil_videos_horizontally,
-                save_video_with_audio,
-            )
-
-            self._crop_dump_index += 1
-            stem = "crop_%03d_src%ds" % (
-                self._crop_dump_index,
-                int(round(len(raw_video) / self.target_fps)),
-            )
-            save_video_with_audio(
-                concat_pil_videos_horizontally(
-                    reference_video[:real_length], generated_video
-                ),
-                stem,
-                dump_dir,
-                audio_path=audio_path,
-            )
-            logger.info("[tbdub] crop comparison dumped: %s/%s.mp4", dump_dir, stem)
-
         blended = blend_crop_video_with_ref(
             generated_video,
             reference_video[:real_length],

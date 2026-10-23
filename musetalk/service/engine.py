@@ -265,9 +265,16 @@ class ServiceConfig:
     # Drop lipsync on large head yaw (InsightFace 1k3d68 degrees, per-shot hysteresis).
     lipsync_yaw_gate: bool = True
     # Sync → non-sync when |yaw| reaches this (degrees).
-    lipsync_yaw_off_deg: float = 75.0
+    # 65, not 75: InsightFace's yaw saturates around 70-74 deg on a genuinely
+    # profile head (measured 54.7-73.5, median 70.8 over a shot that is visually
+    # a full profile), so a 75 deg bar is unreachable for exactly the poses this
+    # gate exists to reject - the whole shot used to pass and TBDub, handed a
+    # mouth box overflowing the facial silhouette, invented jaw geometry.
+    lipsync_yaw_off_deg: float = 65.0
     # Non-sync → sync again only after |yaw| returns within this (degrees).
-    lipsync_yaw_on_deg: float = 65.0
+    # 8 deg of hysteresis: a head wobbling near the profile stays gated, while
+    # one that genuinely turns back to a readable 3/4 view resumes syncing.
+    lipsync_yaw_on_deg: float = 57.0
     lipsync_yaw_model_path: str = (
         "./models/latentsync15/auxiliary/models/buffalo_l/1k3d68.onnx"
     )

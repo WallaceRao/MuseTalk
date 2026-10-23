@@ -37,6 +37,11 @@ Environment=MUSETALK_VAD_PAD_SEC=0.1
 # Dub-silent but visually-talking frames join lipsync so silent audio closes the mouth
 # instead of falling back to the original talking-mouth plate.
 Environment=MUSETALK_CLOSE_MOUTH_ON_SILENCE=1
+# Yaw gate lives in ServiceConfig defaults (off=65/on=57), no env set here.
+# InsightFace 1k3d68 yaw saturates near 70-74 deg on a real profile, so the old
+# 75 deg bar never tripped and full-profile shots got synced. Only override when
+# a deployment needs a different bar: MUSETALK_LIPSYNC_YAW_OFF_DEG / _ON_DEG
+# (also _GATE, _STRIDE).
 
 ExecStart=/home/ubuntu/miniconda3/envs/heng/bin/uvicorn server:app --host 0.0.0.0 --port 8765
 ExecStop=/bin/kill -SIGTERM $MAINPID

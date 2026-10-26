@@ -184,6 +184,15 @@ def _load_service_config() -> ServiceConfig:
     if speak_open is not None:
         config.vsdlm_speak_open_threshold = max(0.0, float(speak_open))
 
+    # Small-mouth adaptive MAR bar: lower the speak MAR threshold for frames
+    # whose tight mouth pixel width < MUSETALK_VSDLM_SMALL_MOUTH_WIDTH_PX (0 = off).
+    sm_width = os.environ.get("MUSETALK_VSDLM_SMALL_MOUTH_WIDTH_PX")
+    if sm_width is not None:
+        config.vsdlm_small_mouth_width_px = max(0, int(sm_width))
+    sm_mar = os.environ.get("MUSETALK_VSDLM_SMALL_MOUTH_MAR_THRESHOLD")
+    if sm_mar is not None:
+        config.vsdlm_small_mouth_mar_threshold = max(0.0, float(sm_mar))
+
     # Loose lip-motion gate (AND on top of op+mar state gate): rolling std of
     # VSDLM open-prob >= OP_STD OR landmark MAR std >= MAR_STD within the
     # activity window. Suppresses frozen-open mouths (surprised gasp) that pass

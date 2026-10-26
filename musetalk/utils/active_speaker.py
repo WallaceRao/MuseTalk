@@ -680,6 +680,7 @@ class VSDLMDetector:
         *,
         open_threshold: float = 0.5,
         mar_threshold: float = 0.12,
+        mar_thresholds: Sequence[Optional[float]] | None = None,
         strong_open_threshold: float = 0.85,
         fps: float = LR_ASD_FPS,
         min_speak_duration_sec: float = 0.2,
@@ -714,8 +715,18 @@ class VSDLMDetector:
                 if mv is not None and np.isfinite(mv):
                     m = float(mv)
             open_ok = np.isfinite(o) and o >= open_threshold
+            # Per-frame MAR bar override: a narrow/small mouth (few mouth
+            # pixels) under-reads landmark MAR, so callers can pass a lowered
+            # threshold for those frames via ``mar_thresholds`` to keep soft
+            # monologue speech from being gated out. ``None`` entries fall back
+            # to the scalar ``mar_threshold``.
+            eff_mar = mar_threshold
+            if mar_thresholds is not None and i < len(mar_thresholds):
+                tv = mar_thresholds[i]
+                if tv is not None and np.isfinite(tv):
+                    eff_mar = float(tv)
             if m is not None:
-                mar_ok = m >= mar_threshold
+                mar_ok = m >= eff_mar
             else:
                 # DWPose mouth landmark unavailable: fall back to a strict
                 # open-prob bar so a missing MAR never suppresses the whole

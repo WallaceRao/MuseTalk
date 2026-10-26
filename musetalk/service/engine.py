@@ -61,6 +61,34 @@ def _debug_dump_masks(stage: str, **masks) -> None:
             json.dump(payload, fh)
     except Exception:
         logger.debug("debug mask dump failed", exc_info=True)
+
+
+def _indices_to_intervals(
+    indices: Sequence[int],
+    fps: float,
+    merge_gap_frames: int = 0,
+) -> list:
+    """Collapse a sorted list of frame indices into ``[(start_sec, end_sec), ...]``.
+
+    Contiguous frames form one interval; a gap of <= ``merge_gap_frames`` frames is
+    bridged so a handful of dropped frames inside a shot does not split the span.
+    ``end_sec`` is exclusive (the frame just past the last synced one).
+    """
+    idx = sorted(set(int(i) for i in indices))
+    if not idx:
+        return []
+    fps = float(fps) if fps and float(fps) > 0 else 25.0
+    gap = max(0, int(merge_gap_frames))
+    intervals: list = []
+    run_start = prev = idx[0]
+    for i in idx[1:]:
+        if i - prev - 1 > gap:
+            intervals.append((run_start / fps, (prev + 1) / fps))
+            run_start = i
+        prev = i
+    intervals.append((run_start / fps, (prev + 1) / fps))
+    return intervals
+
 from musetalk.utils.audio_processor import AudioProcessor
 from musetalk.utils.blending import (
     blend_frames,
@@ -136,6 +164,12 @@ class ServiceConfig:
     # on closed-but-smiling listeners; mar alone is noisy under hands/hair.
     vsdlm_speak_open_threshold: float = 0.5
     vsdlm_speak_mar_threshold: float = 0.12
+    # Small-mouth adaptive MAR bar: a narrow mouth box (few pixels across) makes
+    # the landmark MAR read low, so soft monologue speech gets gated out. When
+    # small_mouth_width_px > 0, frames whose tight mouth width < this use
+    # small_mouth_mar_threshold instead of vsdlm_speak_mar_threshold. 0 = off.
+    vsdlm_small_mouth_width_px: int = 0
+    vsdlm_small_mouth_mar_threshold: float = 0.05
     # Loose lip-motion gate (AND-ed on top of the op+mar state gate): a frame is
     # only "speaking" if the rolling std of VSDLM open-prob >= op_std OR landmark
     # MAR std >= mar_std within the activity window. Kills frozen-open mouths
@@ -744,7 +778,17 @@ class MuseTalkEngine:
         force_chunk: bool = False,
         chunk_duration_sec: Optional[float] = None,
         vad_segments: Optional[List[VadSegment]] = None,
+        dry_run: bool = False,
     ) -> dict:
+        """Run the full lip-sync pipeline.
+
+        ``dry_run=True`` stops right after the speaking/yaw/occlusion gates have
+        produced ``infer_indices`` (the exact frames the generator would be fed)
+        and returns them collapsed into ``lipsync_intervals`` (seconds) WITHOUT
+        running any generation or writing an output file. It also forces the
+        single (non-chunked) path so the reported intervals are computed over the
+        whole video at once and stay globally consistent.
+        """
         video_path = os.path.abspath(video_path)
         audio_path = os.path.abspath(audio_path)
         output_path = os.path.abspath(output_path)
@@ -766,7 +810,9 @@ class MuseTalkEngine:
             video_duration = probe_duration(video_path)
             audio_duration = probe_duration(audio_path)
             effective_duration = min(video_duration, audio_duration)
-            should_chunk = force_chunk or effective_duration > cfg.auto_chunk_threshold_sec
+            should_chunk = (
+                False if dry_run else (force_chunk or effective_duration > cfg.auto_chunk_threshold_sec)
+            )
             if should_chunk:
                 logger.info(
                     "Long video detected (video=%.1fs audio=%.1fs), chunking with %.0fs segments",
@@ -788,6 +834,7 @@ class MuseTalkEngine:
             output_path,
             audio_mux_source=audio_path,
             vad_segments=vad_segments,
+            dry_run=dry_run,
         )
 
     @torch.no_grad()
@@ -1072,6 +1119,7 @@ class MuseTalkEngine:
         preloaded_frames: Optional[List[np.ndarray]] = None,
         preloaded_fps: Optional[float] = None,
         vad_segments: Optional[List[VadSegment]] = None,
+        dry_run: bool = False,
     ) -> dict:
         video_path = os.path.abspath(video_path)
         audio_path = os.path.abspath(audio_path)
@@ -1215,6 +1263,8 @@ class MuseTalkEngine:
                         mouth_mar_list=mouth_mar_list,
                         speak_open_threshold=cfg.vsdlm_speak_open_threshold,
                         speak_mar_threshold=cfg.vsdlm_speak_mar_threshold,
+                        small_mouth_width_px=cfg.vsdlm_small_mouth_width_px,
+                        small_mouth_mar_threshold=cfg.vsdlm_small_mouth_mar_threshold,
                         shot_fill_ratio=cfg.vsdlm_shot_fill_ratio,
                         motion_op_std=cfg.vsdlm_motion_op_std,
                         motion_mar_std=cfg.vsdlm_motion_mar_std,
@@ -1946,6 +1996,26 @@ class MuseTalkEngine:
 
             if not infer_indices and not any(b != coord_placeholder for b in coord_list):
                 raise ValueError("No valid face detected in the input video")
+
+            if dry_run:
+                intervals = _indices_to_intervals(infer_indices, fps)
+                logger.info(
+                    "[dry-run] lip-sync would cover %d frame(s) -> %d interval(s): %s",
+                    len(infer_indices),
+                    len(intervals),
+                    ", ".join(f"{a:.2f}-{b:.2f}s" for a, b in intervals) or "(none)",
+                )
+                return {
+                    "output_path": None,
+                    "frame_count": video_num,
+                    "speaking_frames": int(sum(speaking_mask)),
+                    "lipsync_frames": len(infer_indices),
+                    "fps": float(fps),
+                    "dry_run": True,
+                    "lipsync_intervals": [
+                        {"start": round(a, 3), "end": round(b, 3)} for a, b in intervals
+                    ],
+                }
 
             res_by_index: dict[int, np.ndarray] = {}
             full_frame_by_index: dict[int, np.ndarray] = {}

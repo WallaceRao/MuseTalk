@@ -852,6 +852,8 @@ def build_fused_speaking_mask(
     mouth_mar_list: Sequence[float | None] | None = None,
     speak_open_threshold: float = 0.5,
     speak_mar_threshold: float = 0.12,
+    small_mouth_width_px: int = 0,
+    small_mouth_mar_threshold: float = 0.05,
     shot_fill_ratio: float = 0.35,
     enable_shot_fill: bool = True,
     motion_op_std: float = 0.0,
@@ -982,12 +984,37 @@ def build_fused_speaking_mask(
     if fallback_primary is not None and fallback_primary in open_probs:
         p_coords = coord_streams.get(fallback_primary) or [coord_placeholder] * n
         p_probs = open_probs[fallback_primary]
+        # Small-mouth adaptive MAR bar: a narrow mouth box (few pixels across)
+        # under-reads landmark MAR, so lower the speak bar for those frames so a
+        # soft monologue (e.g. the 84s "月光宝盒" shot) is not gated out. Only
+        # active when small_mouth_width_px > 0 and tight mouth boxes are present.
+        mar_thresholds = None
+        if small_mouth_width_px and small_mouth_width_px > 0 and mouth_coord_list:
+            mar_thresholds = []
+            n_small = 0
+            for i in range(n):
+                b = mouth_coord_list[i] if i < len(mouth_coord_list) else None
+                w = (
+                    float(b[2]) - float(b[0])
+                    if b is not None and len(b) >= 4
+                    else float("nan")
+                )
+                if np.isfinite(w) and 0.0 < w < float(small_mouth_width_px):
+                    mar_thresholds.append(float(small_mouth_mar_threshold))
+                    n_small += 1
+                else:
+                    mar_thresholds.append(None)
+            print(
+                f"[small-mouth MAR] width<{small_mouth_width_px}px -> "
+                f"mar={small_mouth_mar_threshold}: {n_small}/{n} frames lowered"
+            )
         primary_visual = vsdlm_detector.speaking_mask_op_mar(
             p_probs,
             mouth_mar_list,
             p_coords,
             open_threshold=speak_open_threshold,
             mar_threshold=speak_mar_threshold,
+            mar_thresholds=mar_thresholds,
             fps=fps,
             min_speak_duration_sec=loose_min_speak_duration_sec,
             shot_ids=shot_ids,

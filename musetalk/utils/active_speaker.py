@@ -679,6 +679,7 @@ class VSDLMDetector:
         coord_list: Sequence[Tuple[float, float, float, float]],
         *,
         open_threshold: float = 0.5,
+        op_thresholds: Sequence[Optional[float]] | None = None,
         mar_threshold: float = 0.12,
         mar_thresholds: Sequence[Optional[float]] | None = None,
         strong_open_threshold: float = 0.85,
@@ -714,7 +715,15 @@ class VSDLMDetector:
                 mv = mouth_mar_list[i]
                 if mv is not None and np.isfinite(mv):
                     m = float(mv)
-            open_ok = np.isfinite(o) and o >= open_threshold
+            # Per-frame open-prob bar override: a small/narrow mouth under-reads
+            # open-prob too, so callers can lower the op bar for those frames via
+            # ``op_thresholds`` (mirrors ``mar_thresholds``). ``None`` -> scalar.
+            eff_open = open_threshold
+            if op_thresholds is not None and i < len(op_thresholds):
+                tov = op_thresholds[i]
+                if tov is not None and np.isfinite(tov):
+                    eff_open = float(tov)
+            open_ok = np.isfinite(o) and o >= eff_open
             # Per-frame MAR bar override: a narrow/small mouth (few mouth
             # pixels) under-reads landmark MAR, so callers can pass a lowered
             # threshold for those frames via ``mar_thresholds`` to keep soft

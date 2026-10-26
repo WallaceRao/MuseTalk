@@ -854,6 +854,7 @@ def build_fused_speaking_mask(
     speak_mar_threshold: float = 0.12,
     small_mouth_width_px: int = 0,
     small_mouth_mar_threshold: float = 0.05,
+    small_mouth_open_threshold: float = 0.4,
     shot_fill_ratio: float = 0.35,
     enable_shot_fill: bool = True,
     motion_op_std: float = 0.0,
@@ -989,8 +990,12 @@ def build_fused_speaking_mask(
         # soft monologue (e.g. the 84s "月光宝盒" shot) is not gated out. Only
         # active when small_mouth_width_px > 0 and tight mouth boxes are present.
         mar_thresholds = None
+        op_thresholds = None
         if small_mouth_width_px and small_mouth_width_px > 0 and mouth_coord_list:
             mar_thresholds = []
+            lower_op = small_mouth_open_threshold and small_mouth_open_threshold > 0
+            if lower_op:
+                op_thresholds = []
             n_small = 0
             for i in range(n):
                 b = mouth_coord_list[i] if i < len(mouth_coord_list) else None
@@ -1001,18 +1006,24 @@ def build_fused_speaking_mask(
                 )
                 if np.isfinite(w) and 0.0 < w < float(small_mouth_width_px):
                     mar_thresholds.append(float(small_mouth_mar_threshold))
+                    if lower_op:
+                        op_thresholds.append(float(small_mouth_open_threshold))
                     n_small += 1
                 else:
                     mar_thresholds.append(None)
+                    if lower_op:
+                        op_thresholds.append(None)
             print(
                 f"[small-mouth MAR] width<{small_mouth_width_px}px -> "
-                f"mar={small_mouth_mar_threshold}: {n_small}/{n} frames lowered"
+                f"mar={small_mouth_mar_threshold}, op={small_mouth_open_threshold}: "
+                f"{n_small}/{n} frames lowered"
             )
         primary_visual = vsdlm_detector.speaking_mask_op_mar(
             p_probs,
             mouth_mar_list,
             p_coords,
             open_threshold=speak_open_threshold,
+            op_thresholds=op_thresholds,
             mar_threshold=speak_mar_threshold,
             mar_thresholds=mar_thresholds,
             fps=fps,

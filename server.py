@@ -192,6 +192,10 @@ def _load_service_config() -> ServiceConfig:
     sm_mar = os.environ.get("MUSETALK_VSDLM_SMALL_MOUTH_MAR_THRESHOLD")
     if sm_mar is not None:
         config.vsdlm_small_mouth_mar_threshold = max(0.0, float(sm_mar))
+    # Also lower the open-prob bar for the same small-mouth frames (0 = off/keep global).
+    sm_open = os.environ.get("MUSETALK_VSDLM_SMALL_MOUTH_OPEN_THRESHOLD")
+    if sm_open is not None:
+        config.vsdlm_small_mouth_open_threshold = max(0.0, float(sm_open))
 
     # Loose lip-motion gate (AND on top of op+mar state gate): rolling std of
     # VSDLM open-prob >= OP_STD OR landmark MAR std >= MAR_STD within the

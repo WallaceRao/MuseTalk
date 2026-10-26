@@ -170,6 +170,9 @@ class ServiceConfig:
     # small_mouth_mar_threshold instead of vsdlm_speak_mar_threshold. 0 = off.
     vsdlm_small_mouth_width_px: int = 0
     vsdlm_small_mouth_mar_threshold: float = 0.05
+    # For the same small-mouth frames, also lower the open-prob bar (a narrow
+    # mouth under-reads op too). 0 = keep the global speak_open_threshold.
+    vsdlm_small_mouth_open_threshold: float = 0.4
     # Loose lip-motion gate (AND-ed on top of the op+mar state gate): a frame is
     # only "speaking" if the rolling std of VSDLM open-prob >= op_std OR landmark
     # MAR std >= mar_std within the activity window. Kills frozen-open mouths
@@ -1265,6 +1268,7 @@ class MuseTalkEngine:
                         speak_mar_threshold=cfg.vsdlm_speak_mar_threshold,
                         small_mouth_width_px=cfg.vsdlm_small_mouth_width_px,
                         small_mouth_mar_threshold=cfg.vsdlm_small_mouth_mar_threshold,
+                        small_mouth_open_threshold=cfg.vsdlm_small_mouth_open_threshold,
                         shot_fill_ratio=cfg.vsdlm_shot_fill_ratio,
                         motion_op_std=cfg.vsdlm_motion_op_std,
                         motion_mar_std=cfg.vsdlm_motion_mar_std,
